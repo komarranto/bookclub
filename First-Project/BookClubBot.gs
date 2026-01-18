@@ -356,9 +356,29 @@ function getTodayFormatted() {
 }
 
 /**
+ * Проверить, является ли сегодня последним днём спринта
+ */
+function isLastDayOfSprint(sheet) {
+  const daysCount = getSprintDaysCount(sheet);
+  if (daysCount === 0) return false;
+
+  // Получаем последнюю дату спринта
+  const lastDateCell = sheet.getRange(CONFIG.checkboxesStartRow + daysCount - 1, CONFIG.datesColumn).getValue();
+  if (!lastDateCell) return false;
+
+  const lastDate = new Date(lastDateCell);
+  const today = new Date();
+
+  // Сравниваем только день, месяц, год
+  return lastDate.getDate() === today.getDate() &&
+         lastDate.getMonth() === today.getMonth() &&
+         lastDate.getFullYear() === today.getFullYear();
+}
+
+/**
  * Сформировать еженедельное сообщение (красивый дизайн)
  */
-function formatWeeklyMessage(readingData, booksData, commonBook, sprintName) {
+function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isLastDay = false) {
   let msg = '';
 
   // Заголовок
@@ -448,6 +468,9 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName) {
   // Подпись
   msg += '═══════════════════════\n';
   msg += '    _Приятного чтения!_ 📖\n';
+  if (isLastDay) {
+    msg += '\n⚠️ *Внимание, последний день спринта!*\n';
+  }
   msg += '═══════════════════════\n\n';
   msg += '[📊 Открыть таблицу](https://docs.google.com/spreadsheets/d/1SXRwo2Hs9OtFG7ENLkAH2joIjeilavm5Tp0GDIYbLdc/edit?usp=sharing)';
 
@@ -507,8 +530,9 @@ function sendWeeklyReport() {
   const readingData = getReadingData(current, fortnightSheets);
   const booksData = getBooksData(current.sheet);
   const commonBook = getCommonBookInfo(current.sheet);
+  const isLastDay = isLastDayOfSprint(current.sheet);
 
-  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name);
+  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay);
 
   Logger.log('\n--- СООБЩЕНИЕ ---\n' + message);
 
@@ -531,8 +555,11 @@ function testMessage() {
   const readingData = getReadingData(current, fortnightSheets);
   const booksData = getBooksData(current.sheet);
   const commonBook = getCommonBookInfo(current.sheet);
+  const isLastDay = isLastDayOfSprint(current.sheet);
 
-  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name);
+  Logger.log(`Последний день спринта: ${isLastDay}`);
+
+  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay);
 
   Logger.log('\n--- СООБЩЕНИЕ ДЛЯ TELEGRAM ---\n');
   Logger.log(message);
