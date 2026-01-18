@@ -524,6 +524,40 @@ function testMessage() {
 }
 
 /**
+ * 🔍 ОТЛАДКА СТРИКОВ — запусти чтобы понять почему не работают
+ */
+function debugStreaks() {
+  const fortnightSheets = getFortnightSheets();
+  const current = getCurrentSheet();
+  const members = getMembers(current.sheet);
+
+  Logger.log('=== ОТЛАДКА СТРИКОВ ===\n');
+
+  for (const member of members) {
+    Logger.log(`👤 ${member.name}:`);
+
+    // Показываем чекбоксы текущего спринта
+    const daysCount = getSprintDaysCount(current.sheet);
+    const checkboxes = getCheckboxesForMember(current.sheet, member.column, daysCount);
+
+    Logger.log(`   Дней в спринте: ${daysCount}`);
+    Logger.log(`   Чекбоксы (raw): ${JSON.stringify(checkboxes)}`);
+    Logger.log(`   Отмечено дней: ${checkboxes.filter(x => x).length}`);
+
+    // Показываем сырые значения из таблицы
+    if (daysCount > 0) {
+      const rawValues = current.sheet.getRange(CONFIG.checkboxesStartRow, member.column, Math.min(5, daysCount), 1).getValues();
+      Logger.log(`   Первые 5 значений (raw): ${JSON.stringify(rawValues)}`);
+      Logger.log(`   Тип первого значения: ${typeof rawValues[0][0]}`);
+    }
+
+    // Считаем стрик
+    const streak = calculateStreak(member.name, fortnightSheets);
+    Logger.log(`   Стрик: ${streak}\n`);
+  }
+}
+
+/**
  * ⚙️ НАСТРОИТЬ ЕЖЕНЕДЕЛЬНЫЙ ТРИГГЕР
  * Запусти один раз — отчёт будет отправляться каждое воскресенье в 18:00
  */
