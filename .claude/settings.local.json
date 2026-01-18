@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(git add:*)",
-      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial commit: TypeScript project setup\n\n- Add math and string utility functions\n- Add User model and service\n- Add unit tests with Vitest\n- Configure TypeScript and npm scripts\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")"
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ]
   }
 }

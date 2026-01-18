@@ -374,7 +374,7 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName) {
     const medal = i < 3 ? medals[i] : `${i + 1}.`;
     const bar = createProgressBar(m.percentage, 8);
     const streakEmoji = getStreakEmoji(m.streak);
-    const streakText = m.streak > 0 ? ` ${streakEmoji}${m.streak}` : '';
+    const streakText = m.streak >= 3 ? ` ${streakEmoji}${m.streak}` : '';
 
     msg += `│ ${medal} *${m.name}*\n`;
     msg += `│    ${bar} ${m.percentage}% (${m.daysRead}/${m.totalDays})${streakText}\n`;
