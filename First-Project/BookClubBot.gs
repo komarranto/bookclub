@@ -396,13 +396,13 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isL
   let dateString = getTodayFormatted();
   if (daysLeft >= 0) {
     if (daysLeft === 0) {
-      dateString += ' (последний день!)';
+      dateString += '\n   (последний день спринта!)';
     } else if (daysLeft === 1) {
-      dateString += ' (остался 1 день)';
+      dateString += '\n   (остался 1 день до конца спринта)';
     } else if (daysLeft >= 2 && daysLeft <= 4) {
-      dateString += ` (осталось ${daysLeft} дня)`;
+      dateString += `\n   (осталось ${daysLeft} дня до конца спринта)`;
     } else {
-      dateString += ` (осталось ${daysLeft} дней)`;
+      dateString += `\n   (осталось ${daysLeft} дней до конца спринта)`;
     }
   }
 
