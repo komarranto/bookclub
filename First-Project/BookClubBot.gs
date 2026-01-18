@@ -563,6 +563,12 @@ function sendWeeklyReport() {
   Logger.log('\n--- СООБЩЕНИЕ ---\n' + message);
 
   sendTelegramMessage(message);
+
+  // Автоматически создаём новый спринт в последний день
+  if (isLastDay) {
+    Logger.log('🔄 Последний день — создаю новый спринт автоматически...');
+    createNextSprintSilent();
+  }
 }
 
 /**
@@ -664,4 +670,192 @@ function removeAllTriggers() {
     ScriptApp.deleteTrigger(trigger);
   }
   Logger.log('✅ Все триггеры удалены');
+}
+
+// ==================== СОЗДАНИЕ СПРИНТОВ ====================
+
+/**
+ * 📋 МЕНЮ — добавляет кнопку в интерфейс Google Sheets
+ * Вызывается автоматически при открытии таблицы
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('📚 Книжный клуб')
+    .addItem('➕ Создать новый спринт', 'createNextSprint')
+    .addItem('📤 Отправить отчёт сейчас', 'sendWeeklyReport')
+    .addItem('🧪 Тест сообщения (без отправки)', 'testMessage')
+    .addSeparator()
+    .addItem('⚙️ Настроить ежедневный триггер', 'setupDailyTrigger')
+    .addItem('🗑️ Удалить все триггеры', 'removeAllTriggers')
+    .addToUi();
+}
+
+/**
+ * ➕ СОЗДАТЬ НОВЫЙ СПРИНТ
+ * Копирует текущий лист, увеличивает номер, сбрасывает даты и чекбоксы
+ */
+function createNextSprint() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const current = getCurrentSheet();
+
+  // Создаём новый номер спринта
+  const newSprintNumber = current.number + 1;
+  const newSprintName = `Fortnight ${newSprintNumber}`;
+
+  Logger.log(`Создаю новый спринт: ${newSprintName}`);
+
+  // Дублируем текущий лист
+  const newSheet = current.sheet.copyTo(ss);
+  newSheet.setName(newSprintName);
+
+  // Перемещаем новый лист в начало
+  ss.setActiveSheet(newSheet);
+  ss.moveActiveSheet(1);
+
+  // Заполняем новые даты (начиная с завтра)
+  fillSprintDates(newSheet);
+
+  // Сбрасываем все чекбоксы
+  resetAllCheckboxes(newSheet);
+
+  // Сбрасываем чекбоксы "дочитал общую книгу" в правой секции
+  resetBookCheckboxes(newSheet);
+
+  Logger.log(`✅ Спринт "${newSprintName}" создан!`);
+
+  // Показываем уведомление пользователю
+  SpreadsheetApp.getUi().alert(
+    '✅ Новый спринт создан!',
+    `Создан лист "${newSprintName}" с датами на следующие 14 дней.\n\nВсе чекбоксы сброшены.`,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+
+  return newSheet;
+}
+
+/**
+ * 📅 Заполнить даты нового спринта
+ * Начинает с завтрашнего дня, заполняет столько дней, сколько было в предыдущем спринте
+ */
+function fillSprintDates(sheet) {
+  const daysCount = getSprintDaysCount(sheet);
+  if (daysCount === 0) {
+    Logger.log('⚠️ Не удалось определить количество дней в спринте');
+    return;
+  }
+
+  const today = new Date();
+  const MILLIS_PER_DAY = 1000 * 60 * 60 * 24;
+
+  for (let i = 0; i < daysCount; i++) {
+    // Начинаем с завтра
+    const newDate = new Date(today.getTime() + (i + 1) * MILLIS_PER_DAY);
+    const dateString = newDate.toLocaleDateString('ru-RU', {
+      year: '2-digit',
+      month: '2-digit',
+      day: '2-digit'
+    });
+
+    sheet.getRange(CONFIG.checkboxesStartRow + i, CONFIG.datesColumn).setValue(dateString);
+  }
+
+  Logger.log(`📅 Заполнено ${daysCount} дат`);
+}
+
+/**
+ * ☐ Сбросить все чекбоксы чтения (динамически)
+ */
+function resetAllCheckboxes(sheet) {
+  const members = getMembers(sheet);
+  const daysCount = getSprintDaysCount(sheet);
+
+  if (members.length === 0 || daysCount === 0) {
+    Logger.log('⚠️ Не удалось определить границы чекбоксов');
+    return;
+  }
+
+  // Определяем диапазон: от первого участника до последнего, все дни
+  const startCol = members[0].column;
+  const endCol = members[members.length - 1].column;
+  const colCount = endCol - startCol + 1;
+
+  const range = sheet.getRange(CONFIG.checkboxesStartRow, startCol, daysCount, colCount);
+  range.uncheck();
+
+  Logger.log(`☐ Сброшено чекбоксов: ${daysCount} x ${colCount}`);
+}
+
+/**
+ * ☐ Сбросить чекбоксы "дочитал общую книгу" в правой секции
+ */
+function resetBookCheckboxes(sheet) {
+  const section = findBooksSection(sheet);
+  if (!section) {
+    Logger.log('⚠️ Секция книг не найдена, пропускаю сброс');
+    return;
+  }
+
+  const finishedCol = section.col + 2; // L - чекбокс "дочитал"
+
+  // Ищем все чекбоксы в этой колонке (пропускаем заголовки)
+  let row = section.row + 1;
+  let resetCount = 0;
+
+  while (row <= section.row + 30) {
+    const cell = sheet.getRange(row, finishedCol);
+    const value = cell.getValue();
+
+    // Если это чекбокс (true или false), сбрасываем
+    if (value === true || value === false) {
+      cell.uncheck();
+      resetCount++;
+    }
+
+    row++;
+  }
+
+  Logger.log(`☐ Сброшено чекбоксов книг: ${resetCount}`);
+}
+
+/**
+ * 🔄 АВТОМАТИЧЕСКОЕ СОЗДАНИЕ СПРИНТА
+ * Вызывается из sendWeeklyReport в последний день спринта
+ */
+function autoCreateNextSprintIfNeeded() {
+  const current = getCurrentSheet();
+  const daysLeft = getDaysLeftInSprint(current.sheet);
+
+  // Создаём новый спринт только если сегодня последний день
+  if (daysLeft === 0) {
+    Logger.log('🔄 Последний день спринта — создаю новый автоматически');
+    createNextSprintSilent();
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * ➕ Тихое создание спринта (без UI-уведомлений, для автоматического вызова)
+ */
+function createNextSprintSilent() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const current = getCurrentSheet();
+
+  const newSprintNumber = current.number + 1;
+  const newSprintName = `Fortnight ${newSprintNumber}`;
+
+  Logger.log(`🔄 Автосоздание: ${newSprintName}`);
+
+  const newSheet = current.sheet.copyTo(ss);
+  newSheet.setName(newSprintName);
+  ss.moveActiveSheet(1);
+
+  fillSprintDates(newSheet);
+  resetAllCheckboxes(newSheet);
+  resetBookCheckboxes(newSheet);
+
+  Logger.log(`✅ Спринт "${newSprintName}" создан автоматически`);
+
+  return newSheet;
 }
