@@ -359,33 +359,58 @@ function getTodayFormatted() {
  * Проверить, является ли сегодня последним днём спринта
  */
 function isLastDayOfSprint(sheet) {
+  return getDaysLeftInSprint(sheet) === 0;
+}
+
+/**
+ * Получить количество дней до конца спринта
+ */
+function getDaysLeftInSprint(sheet) {
   const daysCount = getSprintDaysCount(sheet);
-  if (daysCount === 0) return false;
+  if (daysCount === 0) return -1;
 
   // Получаем последнюю дату спринта
   const lastDateCell = sheet.getRange(CONFIG.checkboxesStartRow + daysCount - 1, CONFIG.datesColumn).getValue();
-  if (!lastDateCell) return false;
+  if (!lastDateCell) return -1;
 
   const lastDate = new Date(lastDateCell);
   const today = new Date();
 
-  // Сравниваем только день, месяц, год
-  return lastDate.getDate() === today.getDate() &&
-         lastDate.getMonth() === today.getMonth() &&
-         lastDate.getFullYear() === today.getFullYear();
+  // Обнуляем время для корректного сравнения
+  lastDate.setHours(0, 0, 0, 0);
+  today.setHours(0, 0, 0, 0);
+
+  const diffTime = lastDate.getTime() - today.getTime();
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+  return Math.max(0, diffDays);
 }
 
 /**
  * Сформировать еженедельное сообщение (красивый дизайн)
  */
-function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isLastDay = false) {
+function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isLastDay = false, daysLeft = -1) {
   let msg = '';
+
+  // Формируем строку с датой и оставшимися днями
+  let dateString = getTodayFormatted();
+  if (daysLeft >= 0) {
+    if (daysLeft === 0) {
+      dateString += ' (последний день!)';
+    } else if (daysLeft === 1) {
+      dateString += ' (остался 1 день)';
+    } else if (daysLeft >= 2 && daysLeft <= 4) {
+      dateString += ` (осталось ${daysLeft} дня)`;
+    } else {
+      dateString += ` (осталось ${daysLeft} дней)`;
+    }
+  }
 
   // Заголовок
   msg += '═══════════════════════\n';
   msg += `       📚 *КНИЖНЫЙ КЛУБ*\n`;
   msg += `              ${sprintName}\n`;
-  msg += `        ${getTodayFormatted()}\n`;
+  msg += `   ${dateString}\n`;
   msg += '═══════════════════════\n\n';
 
   // Лидер спринта (выделяем особо)
@@ -530,9 +555,10 @@ function sendWeeklyReport() {
   const readingData = getReadingData(current, fortnightSheets);
   const booksData = getBooksData(current.sheet);
   const commonBook = getCommonBookInfo(current.sheet);
-  const isLastDay = isLastDayOfSprint(current.sheet);
+  const daysLeft = getDaysLeftInSprint(current.sheet);
+  const isLastDay = daysLeft === 0;
 
-  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay);
+  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay, daysLeft);
 
   Logger.log('\n--- СООБЩЕНИЕ ---\n' + message);
 
@@ -555,11 +581,13 @@ function testMessage() {
   const readingData = getReadingData(current, fortnightSheets);
   const booksData = getBooksData(current.sheet);
   const commonBook = getCommonBookInfo(current.sheet);
-  const isLastDay = isLastDayOfSprint(current.sheet);
+  const daysLeft = getDaysLeftInSprint(current.sheet);
+  const isLastDay = daysLeft === 0;
 
+  Logger.log(`Дней до конца спринта: ${daysLeft}`);
   Logger.log(`Последний день спринта: ${isLastDay}`);
 
-  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay);
+  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay, daysLeft);
 
   Logger.log('\n--- СООБЩЕНИЕ ДЛЯ TELEGRAM ---\n');
   Logger.log(message);
