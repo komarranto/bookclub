@@ -344,6 +344,18 @@ function getStreakEmoji(streak) {
 }
 
 /**
+ * Получить сегодняшнюю дату в формате "Понедельник, 18.01"
+ */
+function getTodayFormatted() {
+  const days = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
+  const now = new Date();
+  const dayName = days[now.getDay()];
+  const day = now.getDate().toString().padStart(2, '0');
+  const month = (now.getMonth() + 1).toString().padStart(2, '0');
+  return `${dayName}, ${day}.${month}`;
+}
+
+/**
  * Сформировать еженедельное сообщение (красивый дизайн)
  */
 function formatWeeklyMessage(readingData, booksData, commonBook, sprintName) {
@@ -353,6 +365,7 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName) {
   msg += '═══════════════════════\n';
   msg += `       📚 *КНИЖНЫЙ КЛУБ*\n`;
   msg += `              ${sprintName}\n`;
+  msg += `        ${getTodayFormatted()}\n`;
   msg += '═══════════════════════\n\n';
 
   // Лидер спринта (выделяем особо)
@@ -435,7 +448,8 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName) {
   // Подпись
   msg += '═══════════════════════\n';
   msg += '    _Приятного чтения!_ 📖\n';
-  msg += '═══════════════════════';
+  msg += '═══════════════════════\n\n';
+  msg += '[📊 Открыть таблицу](https://docs.google.com/spreadsheets/d/1SXRwo2Hs9OtFG7ENLkAH2joIjeilavm5Tp0GDIYbLdc/edit?usp=sharing)';
 
   return msg;
 }
@@ -563,10 +577,10 @@ function debugStreaks() {
 }
 
 /**
- * ⚙️ НАСТРОИТЬ ЕЖЕНЕДЕЛЬНЫЙ ТРИГГЕР
- * Запусти один раз — отчёт будет отправляться каждое воскресенье в 18:00
+ * ⚙️ НАСТРОИТЬ ЕЖЕДНЕВНЫЙ ТРИГГЕР
+ * Запусти один раз — отчёт будет отправляться каждый день в 19:00 MSK
  */
-function setupWeeklyTrigger() {
+function setupDailyTrigger() {
   // Удаляем старые триггеры
   const triggers = ScriptApp.getProjectTriggers();
   for (const trigger of triggers) {
@@ -575,14 +589,15 @@ function setupWeeklyTrigger() {
     }
   }
 
-  // Создаём новый — каждое воскресенье в 18:00
+  // Создаём новый — каждый день в 19:00 (MSK = UTC+3, значит 16:00 UTC)
   ScriptApp.newTrigger('sendWeeklyReport')
     .timeBased()
-    .onWeekDay(ScriptApp.WeekDay.SUNDAY)
-    .atHour(18)
+    .everyDays(1)
+    .atHour(16)  // 16:00 UTC = 19:00 MSK
+    .inTimezone('Europe/Moscow')
     .create();
 
-  Logger.log('✅ Триггер создан! Отчёт будет приходить каждое воскресенье в 18:00');
+  Logger.log('✅ Триггер создан! Отчёт будет приходить каждый день в 19:00 MSK');
 }
 
 /**
