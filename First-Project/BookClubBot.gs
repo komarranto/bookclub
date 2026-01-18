@@ -139,9 +139,11 @@ function findMemberColumn(sheet, memberName) {
 /**
  * Рассчитать стрик с учётом предыдущих спринтов
  * Ищем участника по ИМЕНИ на каждом листе (а не по номеру колонки)
+ * Стрик считается от последнего отмеченного дня назад
  */
 function calculateStreak(memberName, fortnightSheets) {
   let streak = 0;
+  let foundFirstTrue = false;
 
   for (const sheetInfo of fortnightSheets) {
     // Находим колонку участника по имени
@@ -158,10 +160,13 @@ function calculateStreak(memberName, fortnightSheets) {
     // Идём с конца листа к началу
     for (let i = checkboxes.length - 1; i >= 0; i--) {
       if (checkboxes[i]) {
+        foundFirstTrue = true;
         streak++;
-      } else {
+      } else if (foundFirstTrue) {
+        // Нашли false после true — стрик прервался
         return streak;
       }
+      // Если ещё не нашли первый true — пропускаем false (будущие дни)
     }
     // Весь лист заполнен — продолжаем к предыдущему
   }
