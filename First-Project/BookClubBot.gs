@@ -250,13 +250,27 @@ function getBooksData(sheet) {
     startRow++;
   }
 
-  // Читаем участников до пустой строки
+  // Читаем участников (пропускаем пустые строки из-за объединённых ячеек)
   let row = startRow;
-  while (row <= startRow + 20) {
+  let emptyCount = 0;
+
+  while (row <= startRow + 30 && emptyCount < 5) {
     const name = sheet.getRange(row, nameCol).getValue();
+
     if (!name || !name.toString().trim()) {
-      break;
+      emptyCount++;
+      row++;
+      continue;
     }
+
+    // Пропускаем заголовки
+    const nameLower = name.toString().toLowerCase();
+    if (nameLower.includes('книга') || nameLower.includes('дата') || nameLower.includes('спринт')) {
+      row++;
+      continue;
+    }
+
+    emptyCount = 0;
 
     const book = sheet.getRange(row, bookCol).getValue();
     const finished = sheet.getRange(row, finishedCol).getValue();
