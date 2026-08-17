@@ -750,13 +750,12 @@ function fillSprintDates(sheet) {
   for (let i = 0; i < daysCount; i++) {
     // Начинаем с завтра
     const newDate = new Date(today.getTime() + (i + 1) * MILLIS_PER_DAY);
-    const dateString = newDate.toLocaleDateString('ru-RU', {
-      year: '2-digit',
-      month: '2-digit',
-      day: '2-digit'
-    });
 
-    sheet.getRange(CONFIG.checkboxesStartRow + i, CONFIG.datesColumn).setValue(dateString);
+    // Пишем настоящий объект Date (не строку!) — иначе getDaysLeftInSprint()
+    // не сможет распарсить дату обратно на авто-созданных спринтах
+    sheet.getRange(CONFIG.checkboxesStartRow + i, CONFIG.datesColumn)
+      .setValue(newDate)
+      .setNumberFormat('dd.MM.yy');
   }
 
   Logger.log(`📅 Заполнено ${daysCount} дат`);
