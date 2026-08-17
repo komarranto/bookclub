@@ -603,6 +603,113 @@ function sendTelegramMessage(message) {
   }
 }
 
+// ==================== ДОСТИЖЕНИЯ ====================
+
+const ACHIEVEMENTS_SHEET_NAME = 'Achievements';
+
+// Бейджи, которые можно безопасно посчитать из уже существующих данных
+// (без хранения истории по дням) — см. обоснование в плане улучшений.
+const BADGES = {
+  PERFECT_SPRINT: '🎯 Идеальный спринт',
+  STREAK_14: '💎 Стрик 14+ дней',
+  STREAK_30: '🌟 Стрик 30+ дней'
+};
+
+/**
+ * Найти или создать служебный лист для хранения выданных бейджей.
+ * Лист скрыт и не попадает в getFortnightSheets (имя не матчится regex'ом Fortnight).
+ */
+function getOrCreateAchievementsSheet(ss) {
+  let sheet = ss.getSheetByName(ACHIEVEMENTS_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(ACHIEVEMENTS_SHEET_NAME);
+    sheet.getRange(1, 1, 1, 3).setValues([['Имя', 'Бейдж', 'Спринт']]);
+    sheet.hideSheet();
+  }
+  return sheet;
+}
+
+/**
+ * Прочитать все уже выданные бейджи одним запросом (не поячеечно)
+ */
+function readExistingAchievements(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const values = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+  return values.map(row => ({ name: row[0], badge: row[1], sprint: row[2] }));
+}
+
+/**
+ * Начислить бейджи за текущий отчёт.
+ * - "Идеальный спринт" выдаётся один раз за спринт (только в isLastDay).
+ * - Стрик-бейджи выдаются один раз за всё время (не привязаны к спринту),
+ *   т.к. стрик считается сквозь границы спринтов.
+ * Дедупликация — по уже существующим записям на листе Achievements,
+ * читаем их один раз в начале, а не проверяем ячейку за ячейкой.
+ *
+ * Возвращает список новых бейджей "за сегодня" — для отдельного
+ * уведомления в Telegram. Ничего не возвращает и не бросает наружу,
+ * если писать было нечего.
+ */
+function awardBadges(readingData, current, isLastDay) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getOrCreateAchievementsSheet(ss);
+  const existing = readExistingAchievements(sheet);
+
+  const hasForSprint = (name, badge, sprint) =>
+    existing.some(r => r.name === name && r.badge === badge && r.sprint === sprint);
+  const hasEver = (name, badge) =>
+    existing.some(r => r.name === name && r.badge === badge);
+
+  const newRows = [];
+  const newBadgesByMember = [];
+
+  for (const member of readingData) {
+    const earnedNow = [];
+
+    if (
+      isLastDay &&
+      member.totalDays > 0 &&
+      member.daysRead === member.totalDays &&
+      !hasForSprint(member.name, BADGES.PERFECT_SPRINT, current.name)
+    ) {
+      earnedNow.push(BADGES.PERFECT_SPRINT);
+      newRows.push([member.name, BADGES.PERFECT_SPRINT, current.name]);
+    }
+
+    if (member.streak >= 30 && !hasEver(member.name, BADGES.STREAK_30)) {
+      earnedNow.push(BADGES.STREAK_30);
+      newRows.push([member.name, BADGES.STREAK_30, current.name]);
+    } else if (member.streak >= 14 && !hasEver(member.name, BADGES.STREAK_14)) {
+      earnedNow.push(BADGES.STREAK_14);
+      newRows.push([member.name, BADGES.STREAK_14, current.name]);
+    }
+
+    if (earnedNow.length > 0) {
+      newBadgesByMember.push({ name: member.name, badges: earnedNow });
+    }
+  }
+
+  if (newRows.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, 3).setValues(newRows);
+  }
+
+  return newBadgesByMember;
+}
+
+/**
+ * Короткое сообщение про новые бейджи — отдельно от основного отчёта,
+ * чтобы легко было выключить одной строкой, если не понравится.
+ */
+function formatNewBadgesMessage(newBadgesByMember) {
+  let msg = '🎉 *Новые бейджи!*\n\n';
+  for (const entry of newBadgesByMember) {
+    msg += `👤 *${entry.name}*: ${entry.badges.join(', ')}\n`;
+  }
+  return msg;
+}
+
 // ==================== ГЛАВНЫЕ ФУНКЦИИ ====================
 
 /**
@@ -628,6 +735,16 @@ function sendWeeklyReport() {
   Logger.log('\n--- СООБЩЕНИЕ ---\n' + message);
 
   sendTelegramMessage(message);
+
+  // Начисление бейджей — не должно ронять отправку отчёта, если что-то пойдёт не так
+  try {
+    const newBadges = awardBadges(readingData, current, isLastDay);
+    if (newBadges.length > 0) {
+      sendTelegramMessage(formatNewBadgesMessage(newBadges));
+    }
+  } catch (error) {
+    Logger.log('⚠️ Ошибка при начислении бейджей: ' + error);
+  }
 
   // Автоматически создаём новый спринт в последний день
   if (isLastDay) {
