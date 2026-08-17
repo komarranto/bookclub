@@ -213,6 +213,26 @@ function getReadingData(currentSheet, fortnightSheets) {
 }
 
 /**
+ * Средний процент прочтения по клубу на конкретном листе спринта
+ * (без стриков — они тут не нужны, только для сравнения "спринт к спринту")
+ */
+function getSprintAveragePercent(sheetInfo) {
+  const members = getMembers(sheetInfo.sheet);
+  const daysCount = getSprintDaysCount(sheetInfo.sheet);
+
+  if (members.length === 0 || daysCount === 0) return null;
+
+  let totalPercent = 0;
+  for (const member of members) {
+    const checkboxes = getCheckboxesForMember(sheetInfo.sheet, member.column, daysCount);
+    if (checkboxes.length === 0) continue;
+    totalPercent += (checkboxes.filter(x => x).length / checkboxes.length) * 100;
+  }
+
+  return Math.round(totalPercent / members.length);
+}
+
+/**
  * Найти секцию с книгами (ищем заголовок "Основная книга" или похожий)
  */
 function findBooksSection(sheet) {
@@ -389,7 +409,7 @@ function getDaysLeftInSprint(sheet) {
 /**
  * Сформировать еженедельное сообщение (красивый дизайн)
  */
-function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isLastDay = false, daysLeft = -1) {
+function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isLastDay = false, daysLeft = -1, previousAvg = null) {
   let msg = '';
 
   // Формируем строку с датой и оставшимися днями
@@ -412,6 +432,17 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isL
   msg += `              ${sprintName}\n`;
   msg += `   ${dateString}\n`;
   msg += '═══════════════════════\n\n';
+
+  // Сравнение со средним прошлого спринта (если есть с чем сравнивать)
+  if (previousAvg !== null && readingData.length > 0) {
+    const currentAvg = Math.round(
+      readingData.reduce((sum, m) => sum + m.percentage, 0) / readingData.length
+    );
+    const diff = currentAvg - previousAvg;
+    const arrow = diff > 0 ? '🔺' : diff < 0 ? '🔻' : '▪️';
+    const diffText = diff > 0 ? `+${diff}` : `${diff}`;
+    msg += `${arrow} *${diffText}%* к прошлому спринту (было ${previousAvg}%, сейчас ${currentAvg}%)\n\n`;
+  }
 
   // Лидер спринта (выделяем особо)
   if (readingData.length > 0) {
@@ -557,8 +588,10 @@ function sendWeeklyReport() {
   const commonBook = getCommonBookInfo(current.sheet);
   const daysLeft = getDaysLeftInSprint(current.sheet);
   const isLastDay = daysLeft === 0;
+  // Предыдущий спринт — это следующий элемент в отсортированном по убыванию списке
+  const previousAvg = fortnightSheets.length > 1 ? getSprintAveragePercent(fortnightSheets[1]) : null;
 
-  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay, daysLeft);
+  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay, daysLeft, previousAvg);
 
   Logger.log('\n--- СООБЩЕНИЕ ---\n' + message);
 
@@ -597,11 +630,13 @@ function testMessage() {
   const commonBook = getCommonBookInfo(current.sheet);
   const daysLeft = getDaysLeftInSprint(current.sheet);
   const isLastDay = daysLeft === 0;
+  const previousAvg = fortnightSheets.length > 1 ? getSprintAveragePercent(fortnightSheets[1]) : null;
 
   Logger.log(`Дней до конца спринта: ${daysLeft}`);
   Logger.log(`Последний день спринта: ${isLastDay}`);
+  Logger.log(`Средний % прошлого спринта: ${previousAvg === null ? 'нет данных' : previousAvg + '%'}`);
 
-  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay, daysLeft);
+  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay, daysLeft, previousAvg);
 
   Logger.log('\n--- СООБЩЕНИЕ ДЛЯ TELEGRAM ---\n');
   Logger.log(message);
