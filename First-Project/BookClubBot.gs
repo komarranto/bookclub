@@ -848,6 +848,7 @@ function createNextSprintSilent() {
 
   const newSheet = current.sheet.copyTo(ss);
   newSheet.setName(newSprintName);
+  ss.setActiveSheet(newSheet);
   ss.moveActiveSheet(1);
 
   fillSprintDates(newSheet);
