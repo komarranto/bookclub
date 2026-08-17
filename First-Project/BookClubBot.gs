@@ -527,8 +527,7 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isL
   if (isLastDay) {
     msg += '\n⚠️ *Внимание, последний день спринта!*\n';
   }
-  msg += '═══════════════════════\n\n';
-  msg += '[📊 Открыть таблицу](https://docs.google.com/spreadsheets/d/1SXRwo2Hs9OtFG7ENLkAH2joIjeilavm5Tp0GDIYbLdc/edit?usp=sharing)';
+  msg += '═══════════════════════';
 
   return msg;
 }
@@ -544,7 +543,12 @@ function sendTelegramMessage(message) {
   const payload = {
     chat_id: TELEGRAM_CHAT_ID,
     text: message,
-    parse_mode: 'Markdown'
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [[
+        { text: '📊 Открыть таблицу', url: SpreadsheetApp.getActiveSpreadsheet().getUrl() }
+      ]]
+    }
   };
 
   const options = {
