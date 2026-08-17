@@ -567,7 +567,15 @@ function sendWeeklyReport() {
   // Автоматически создаём новый спринт в последний день
   if (isLastDay) {
     Logger.log('🔄 Последний день — создаю новый спринт автоматически...');
-    createNextSprintSilent();
+    try {
+      createNextSprint(true);
+    } catch (error) {
+      Logger.log('❌ Не удалось создать новый спринт автоматически: ' + error);
+      sendTelegramMessage(
+        '⚠️ Не удалось автоматически создать новый спринт.\n' +
+        'Нужно создать вручную: меню *📚 Книжный клуб → ➕ Создать новый спринт*.'
+      );
+    }
   }
 }
 
@@ -691,49 +699,6 @@ function onOpen() {
 }
 
 /**
- * ➕ СОЗДАТЬ НОВЫЙ СПРИНТ
- * Копирует текущий лист, увеличивает номер, сбрасывает даты и чекбоксы
- */
-function createNextSprint() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const current = getCurrentSheet();
-
-  // Создаём новый номер спринта
-  const newSprintNumber = current.number + 1;
-  const newSprintName = `Fortnight ${newSprintNumber}`;
-
-  Logger.log(`Создаю новый спринт: ${newSprintName}`);
-
-  // Дублируем текущий лист
-  const newSheet = current.sheet.copyTo(ss);
-  newSheet.setName(newSprintName);
-
-  // Перемещаем новый лист в начало
-  ss.setActiveSheet(newSheet);
-  ss.moveActiveSheet(1);
-
-  // Заполняем новые даты (начиная с завтра)
-  fillSprintDates(newSheet);
-
-  // Сбрасываем все чекбоксы
-  resetAllCheckboxes(newSheet);
-
-  // Сбрасываем чекбоксы "дочитал общую книгу" в правой секции
-  resetBookCheckboxes(newSheet);
-
-  Logger.log(`✅ Спринт "${newSprintName}" создан!`);
-
-  // Показываем уведомление пользователю
-  SpreadsheetApp.getUi().alert(
-    '✅ Новый спринт создан!',
-    `Создан лист "${newSprintName}" с датами на следующие 14 дней.\n\nВсе чекбоксы сброшены.`,
-    SpreadsheetApp.getUi().ButtonSet.OK
-  );
-
-  return newSheet;
-}
-
-/**
  * 📅 Заполнить даты нового спринта
  * Начинает с завтрашнего дня, заполняет столько дней, сколько было в предыдущем спринте
  */
@@ -817,45 +782,64 @@ function resetBookCheckboxes(sheet) {
 }
 
 /**
- * 🔄 АВТОМАТИЧЕСКОЕ СОЗДАНИЕ СПРИНТА
- * Вызывается из sendWeeklyReport в последний день спринта
+ * ➕ СОЗДАТЬ НОВЫЙ СПРИНТ
+ * Копирует текущий лист, увеличивает номер, сбрасывает даты и чекбоксы.
+ *
+ * silent = false (по умолчанию) — вызов из меню, показывает UI-алерт.
+ * silent = true — автоматический вызов из sendWeeklyReport, без UI.
+ *
+ * Защищена от двойного срабатывания:
+ * - LockService не даёт выполниться двум вызовам одновременно
+ *   (например ручной запуск + сработавший в то же время триггер);
+ * - если лист с таким именем уже существует — создание пропускается,
+ *   а не падает с необработанной ошибкой на newSheet.setName(...).
  */
-function autoCreateNextSprintIfNeeded() {
-  const current = getCurrentSheet();
-  const daysLeft = getDaysLeftInSprint(current.sheet);
-
-  // Создаём новый спринт только если сегодня последний день
-  if (daysLeft === 0) {
-    Logger.log('🔄 Последний день спринта — создаю новый автоматически');
-    createNextSprintSilent();
-    return true;
+function createNextSprint(silent = false) {
+  const lock = LockService.getScriptLock();
+  const gotLock = lock.tryLock(30000);
+  if (!gotLock) {
+    Logger.log('⚠️ Не удалось получить блокировку — создание спринта уже выполняется параллельно');
+    return null;
   }
 
-  return false;
-}
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const current = getCurrentSheet();
 
-/**
- * ➕ Тихое создание спринта (без UI-уведомлений, для автоматического вызова)
- */
-function createNextSprintSilent() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const current = getCurrentSheet();
+    const newSprintNumber = current.number + 1;
+    const newSprintName = `Fortnight ${newSprintNumber}`;
 
-  const newSprintNumber = current.number + 1;
-  const newSprintName = `Fortnight ${newSprintNumber}`;
+    // Лист с таким именем уже есть — значит спринт уже кто-то создал
+    // (повторный триггер, ручной запуск сразу после автоматического и т.п.)
+    const existingSheet = ss.getSheetByName(newSprintName);
+    if (existingSheet) {
+      Logger.log(`⚠️ Лист "${newSprintName}" уже существует — пропускаю создание`);
+      return existingSheet;
+    }
 
-  Logger.log(`🔄 Автосоздание: ${newSprintName}`);
+    Logger.log(`Создаю новый спринт: ${newSprintName}`);
 
-  const newSheet = current.sheet.copyTo(ss);
-  newSheet.setName(newSprintName);
-  ss.setActiveSheet(newSheet);
-  ss.moveActiveSheet(1);
+    const newSheet = current.sheet.copyTo(ss);
+    newSheet.setName(newSprintName);
+    ss.setActiveSheet(newSheet);
+    ss.moveActiveSheet(1);
 
-  fillSprintDates(newSheet);
-  resetAllCheckboxes(newSheet);
-  resetBookCheckboxes(newSheet);
+    fillSprintDates(newSheet);
+    resetAllCheckboxes(newSheet);
+    resetBookCheckboxes(newSheet);
 
-  Logger.log(`✅ Спринт "${newSprintName}" создан автоматически`);
+    Logger.log(`✅ Спринт "${newSprintName}" создан!`);
 
-  return newSheet;
+    if (!silent) {
+      SpreadsheetApp.getUi().alert(
+        '✅ Новый спринт создан!',
+        `Создан лист "${newSprintName}" с датами на следующие 14 дней.\n\nВсе чекбоксы сброшены.`,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
+
+    return newSheet;
+  } finally {
+    lock.releaseLock();
+  }
 }
