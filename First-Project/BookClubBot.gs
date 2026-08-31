@@ -3,6 +3,12 @@
 const TELEGRAM_BOT_TOKEN = 'ВАШ_ТОКЕН_БОТА';  // Получить у @BotFather
 const TELEGRAM_CHAT_ID = 'ВАШ_CHAT_ID';        // ID чата или группы
 
+// Секрет для проверки вебхука (см. раздел "Команды в Telegram" в README).
+// Сгенерируй любую длинную случайную строку и используй её же при вызове
+// setupTelegramWebhook() — Telegram будет присылать её в каждом запросе,
+// так doPost() отличает реальные апдейты Telegram от чужих запросов на /exec.
+const TELEGRAM_WEBHOOK_SECRET = 'ВАШ_СЕКРЕТ_ВЕБХУКА';
+
 // Настройки структуры таблицы (минимальные - остальное определяется автоматически)
 const CONFIG = {
   // Левая часть: трекер чтения
@@ -39,6 +45,12 @@ const READING_QUOTES = [
   '«Читать — значит расти в несколько раз быстрее, чем позволяет собственная жизнь» — неизвестный автор',
   '«Книги — это пчёлы, которые несут цветочную пыльцу от одного ума к другому» — Джеймс Расселл Лоуэлл'
 ];
+
+// Настройки предложения даты следующей офлайн-встречи клуба (команды /meeting_done, /another_time)
+const MEETING_INTERVAL_WEEKS = 6; // базовый интервал между встречами
+// Ровно 5 слотов, равномерно от утра до вечера — на каждый день выходных,
+// итого 5 + 5 = 10 вариантов, это максимум, который допускает Telegram Poll
+const MEETING_TIME_SLOTS = ['11:00', '13:30', '16:00', '18:30', '21:00'];
 
 // ==================== РАБОТА С ЛИСТАМИ ====================
 
@@ -601,6 +613,110 @@ function sendTelegramMessage(message) {
     Logger.log('❌ Ошибка: ' + error);
     throw error;
   }
+}
+
+/**
+ * Отправить нативный Telegram Poll (опрос) — используется для выбора
+ * даты/времени следующей встречи клуба (см. секцию "ВСТРЕЧИ КЛУБА")
+ */
+function sendTelegramPoll(question, options) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPoll`;
+
+  const payload = {
+    chat_id: TELEGRAM_CHAT_ID,
+    question: question,
+    options: options,
+    is_anonymous: false,
+    allows_multiple_answers: false
+  };
+
+  const requestOptions = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(url, requestOptions);
+    const result = JSON.parse(response.getContentText());
+
+    if (result.ok) {
+      Logger.log('✅ Опрос отправлен!');
+    } else {
+      Logger.log('❌ Ошибка Telegram (sendPoll): ' + result.description);
+    }
+
+    return result;
+  } catch (error) {
+    Logger.log('❌ Ошибка: ' + error);
+    throw error;
+  }
+}
+
+// ==================== ВСТРЕЧИ КЛУБА ====================
+
+/**
+ * Найти ближайшую субботу на дату targetDate или после неё,
+ * и воскресенье сразу за ней.
+ */
+function getUpcomingWeekend(targetDate) {
+  const date = new Date(targetDate.getTime());
+  date.setHours(0, 0, 0, 0);
+
+  // getDay(): 0 = вс, 6 = сб. Считаем, сколько дней до ближайшей субботы.
+  const daysUntilSaturday = (6 - date.getDay() + 7) % 7;
+  const saturday = new Date(date.getTime() + daysUntilSaturday * 24 * 60 * 60 * 1000);
+  const sunday = new Date(saturday.getTime() + 24 * 60 * 60 * 1000);
+
+  return { saturday, sunday };
+}
+
+/**
+ * Дата в формате "сб 20 авг" для вариантов опроса
+ */
+function formatShortDate(date) {
+  const weekdays = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
+  const months = ['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+  return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]}`;
+}
+
+/**
+ * Построить ровно 10 вариантов ответа для опроса: суббота и воскресенье
+ * ближайших к targetDate выходных, на каждый день — все MEETING_TIME_SLOTS
+ */
+function buildMeetingPollOptions(targetDate) {
+  const { saturday, sunday } = getUpcomingWeekend(targetDate);
+  const options = [];
+
+  for (const day of [saturday, sunday]) {
+    for (const time of MEETING_TIME_SLOTS) {
+      options.push(`${formatShortDate(day)}, ${time}`);
+    }
+  }
+
+  return options;
+}
+
+/**
+ * Отправить опрос с вариантами даты/времени встречи и запомнить
+ * фактически предложенную субботу в PropertiesService (без листов —
+ * это встроенное хранилище ключ-значение Apps Script, ничего не создаёт
+ * в самой таблице), чтобы /another_time знал, от чего отсчитывать неделю.
+ */
+function proposeMeetingPoll(targetDate) {
+  const { saturday, sunday } = getUpcomingWeekend(targetDate);
+  const question = `📅 Встреча книжного клуба — выбираем дату и время (${formatShortDate(saturday)} / ${formatShortDate(sunday)})`;
+  const options = buildMeetingPollOptions(targetDate);
+
+  sendTelegramPoll(question, options);
+
+  PropertiesService.getScriptProperties().setProperty(
+    'lastProposedMeetingDate',
+    saturday.toISOString()
+  );
+
+  Logger.log(`📅 Предложены даты встречи: ${formatShortDate(saturday)} / ${formatShortDate(sunday)}`);
 }
 
 // ==================== ДОСТИЖЕНИЯ ====================
