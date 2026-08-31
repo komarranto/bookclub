@@ -709,24 +709,40 @@ function buildMeetingPollOptions(targetDate) {
  * в самой таблице), чтобы /another_time знал, от чего отсчитывать неделю.
  */
 function proposeMeetingPoll(targetDate) {
-  const props = PropertiesService.getScriptProperties();
-
-  const lastCommandAt = Number(props.getProperty('lastMeetingCommandAt') || 0);
-  if (Date.now() - lastCommandAt < MEETING_COMMAND_COOLDOWN_MS) {
-    Logger.log('⚠️ Команда встречи проигнорирована — слишком рано после предыдущей (защита от дублей)');
+  // LockService делает проверку и запись cooldown атомарными. Без лока
+  // несколько параллельных доставок doPost (Telegram может резко
+  // выгрузить пачку зависших сообщений разом) могли одновременно
+  // проверить "не рано ли" ДО того, как первый из них запишет новое
+  // время — и проскочить все разом, устроив спам одинаковых опросов.
+  const lock = LockService.getScriptLock();
+  const gotLock = lock.tryLock(10000);
+  if (!gotLock) {
+    Logger.log('⚠️ Не удалось получить блокировку для отправки опроса — пропускаю');
     return;
   }
-  props.setProperty('lastMeetingCommandAt', String(Date.now()));
 
-  const { saturday, sunday } = getUpcomingWeekend(targetDate);
-  const question = `📅 Встреча книжного клуба — выбираем дату и время (${formatShortDate(saturday)} / ${formatShortDate(sunday)})`;
-  const options = buildMeetingPollOptions(targetDate);
+  try {
+    const props = PropertiesService.getScriptProperties();
 
-  sendTelegramPoll(question, options);
+    const lastCommandAt = Number(props.getProperty('lastMeetingCommandAt') || 0);
+    if (Date.now() - lastCommandAt < MEETING_COMMAND_COOLDOWN_MS) {
+      Logger.log('⚠️ Команда встречи проигнорирована — слишком рано после предыдущей (защита от дублей)');
+      return;
+    }
+    props.setProperty('lastMeetingCommandAt', String(Date.now()));
 
-  props.setProperty('lastProposedMeetingDate', saturday.toISOString());
+    const { saturday, sunday } = getUpcomingWeekend(targetDate);
+    const question = `📅 Встреча книжного клуба — выбираем дату и время (${formatShortDate(saturday)} / ${formatShortDate(sunday)})`;
+    const options = buildMeetingPollOptions(targetDate);
 
-  Logger.log(`📅 Предложены даты встречи: ${formatShortDate(saturday)} / ${formatShortDate(sunday)}`);
+    sendTelegramPoll(question, options);
+
+    props.setProperty('lastProposedMeetingDate', saturday.toISOString());
+
+    Logger.log(`📅 Предложены даты встречи: ${formatShortDate(saturday)} / ${formatShortDate(sunday)}`);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /**
