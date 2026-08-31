@@ -719,6 +719,28 @@ function proposeMeetingPoll(targetDate) {
   Logger.log(`📅 Предложены даты встречи: ${formatShortDate(saturday)} / ${formatShortDate(sunday)}`);
 }
 
+/**
+ * Команда /meeting_done — «встреча прошла»: предложить даты через
+ * MEETING_INTERVAL_WEEKS недель от сегодня.
+ */
+function handleMeetingDoneCommand() {
+  const targetDate = new Date(Date.now() + MEETING_INTERVAL_WEEKS * 7 * 24 * 60 * 60 * 1000);
+  proposeMeetingPoll(targetDate);
+}
+
+/**
+ * Команда /another_time — «предложенное время не подходит»: сдвинуть
+ * предложение на неделю вперёд от последней предложенной субботы.
+ * Если предыдущего предложения нет (например, после установки скрипта) —
+ * отсчитываем от сегодня, чтобы команда не падала с ошибкой.
+ */
+function handleAnotherTimeCommand() {
+  const lastProposed = PropertiesService.getScriptProperties().getProperty('lastProposedMeetingDate');
+  const baseDate = lastProposed ? new Date(lastProposed) : new Date();
+  const targetDate = new Date(baseDate.getTime() + 7 * 24 * 60 * 60 * 1000);
+  proposeMeetingPoll(targetDate);
+}
+
 // ==================== ДОСТИЖЕНИЯ ====================
 
 const ACHIEVEMENTS_SHEET_NAME = 'Achievements';
