@@ -51,6 +51,10 @@ const MEETING_INTERVAL_WEEKS = 6; // базовый интервал между 
 // Ровно 5 слотов, равномерно от утра до вечера — на каждый день выходных,
 // итого 5 + 5 = 10 вариантов, это максимум, который допускает Telegram Poll
 const MEETING_TIME_SLOTS = ['11:00', '13:30', '16:00', '18:30', '21:00'];
+// Защита от дублей: если команду /meeting_done или /another_time уже
+// обработали недавно — новую не обрабатываем (спам из очереди Telegram,
+// случайное повторное нажатие и т.п. не должны присылать кучу опросов подряд)
+const MEETING_COMMAND_COOLDOWN_MS = 2 * 60 * 1000; // 2 минуты
 
 // ==================== РАБОТА С ЛИСТАМИ ====================
 
@@ -705,16 +709,22 @@ function buildMeetingPollOptions(targetDate) {
  * в самой таблице), чтобы /another_time знал, от чего отсчитывать неделю.
  */
 function proposeMeetingPoll(targetDate) {
+  const props = PropertiesService.getScriptProperties();
+
+  const lastCommandAt = Number(props.getProperty('lastMeetingCommandAt') || 0);
+  if (Date.now() - lastCommandAt < MEETING_COMMAND_COOLDOWN_MS) {
+    Logger.log('⚠️ Команда встречи проигнорирована — слишком рано после предыдущей (защита от дублей)');
+    return;
+  }
+  props.setProperty('lastMeetingCommandAt', String(Date.now()));
+
   const { saturday, sunday } = getUpcomingWeekend(targetDate);
   const question = `📅 Встреча книжного клуба — выбираем дату и время (${formatShortDate(saturday)} / ${formatShortDate(sunday)})`;
   const options = buildMeetingPollOptions(targetDate);
 
   sendTelegramPoll(question, options);
 
-  PropertiesService.getScriptProperties().setProperty(
-    'lastProposedMeetingDate',
-    saturday.toISOString()
-  );
+  props.setProperty('lastProposedMeetingDate', saturday.toISOString());
 
   Logger.log(`📅 Предложены даты встречи: ${formatShortDate(saturday)} / ${formatShortDate(sunday)}`);
 }
