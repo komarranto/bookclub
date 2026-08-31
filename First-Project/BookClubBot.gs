@@ -631,7 +631,7 @@ function sendTelegramPoll(question, options) {
     question: question,
     options: options,
     is_anonymous: false,
-    allows_multiple_answers: false
+    allows_multiple_answers: true
   };
 
   const requestOptions = {
