@@ -1002,6 +1002,96 @@ function removeAllTriggers() {
   Logger.log('✅ Все триггеры удалены');
 }
 
+// ==================== ВЕБХУК TELEGRAM ====================
+
+/**
+ * Точка входа вебхука — Telegram шлёт сюда POST-запрос на каждое
+ * сообщение/команду в чате, где есть бот. Требует, чтобы скрипт был
+ * опубликован как Web App (Deploy → New deployment → Web app) и
+ * зарегистрирован через setupTelegramWebhook() — см. README, раздел
+ * "Команды в Telegram".
+ *
+ * Всегда возвращает 200 OK (даже при внутренней ошибке) — иначе
+ * Telegram будет бесконечно ретраить один и тот же апдейт.
+ */
+function doPost(e) {
+  try {
+    // Проверяем секрет. Apps Script doPost(e) НЕ даёт доступа к HTTP-заголовкам
+    // (ограничение платформы), поэтому секрет — часть самого URL вебхука
+    // (query-параметр ?secret=..., который setupTelegramWebhook() дописывает
+    // сама). Отсекает посторонние запросы на публичный /exec-адрес.
+    if (!e.parameter || e.parameter.secret !== TELEGRAM_WEBHOOK_SECRET) {
+      Logger.log('⚠️ Отклонён запрос на вебхук с неверным secret');
+      return ContentService.createTextOutput('ignored');
+    }
+
+    const update = JSON.parse(e.postData.contents);
+    const message = update.message;
+
+    if (!message || !message.text) {
+      return ContentService.createTextOutput('ok');
+    }
+
+    // Команды принимаем только из чата клуба — не реагируем на личные
+    // сообщения боту от кого угодно
+    if (String(message.chat.id) !== String(TELEGRAM_CHAT_ID)) {
+      Logger.log(`⚠️ Команда из чужого чата (${message.chat.id}) проигнорирована`);
+      return ContentService.createTextOutput('ignored');
+    }
+
+    const text = message.text.trim();
+
+    if (text.startsWith('/meeting_done')) {
+      handleMeetingDoneCommand();
+    } else if (text.startsWith('/another_time')) {
+      handleAnotherTimeCommand();
+    }
+
+    return ContentService.createTextOutput('ok');
+  } catch (error) {
+    Logger.log('❌ Ошибка в doPost: ' + error);
+    return ContentService.createTextOutput('error');
+  }
+}
+
+/**
+ * ⚙️ РАЗОВАЯ НАСТРОЙКА ВЕБХУКА
+ * Запусти вручную один раз после того, как задеплоил скрипт как Web App
+ * (Deploy → New deployment → Web app, Execute as: Me, Who has access: Anyone).
+ *
+ * webAppUrl — это тот самый .../exec адрес, который Apps Script выдаёт
+ * после деплоя, БЕЗ query-параметров (функция сама дописывает ?secret=...
+ * из TELEGRAM_WEBHOOK_SECRET). Вставь его как аргумент вызова из редактора —
+ * сама функция URL нигде не хранит, только передаёт его в Telegram.
+ */
+function setupTelegramWebhook(webAppUrl) {
+  const separator = webAppUrl.includes('?') ? '&' : '?';
+  const webhookUrlWithSecret = `${webAppUrl}${separator}secret=${encodeURIComponent(TELEGRAM_WEBHOOK_SECRET)}`;
+
+  const setWebhookUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`;
+  const response = UrlFetchApp.fetch(setWebhookUrl, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ url: webhookUrlWithSecret }),
+    muteHttpExceptions: true
+  });
+  Logger.log('setWebhook: ' + response.getContentText());
+
+  const setCommandsUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setMyCommands`;
+  const commandsResponse = UrlFetchApp.fetch(setCommandsUrl, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({
+      commands: [
+        { command: 'meeting_done', description: 'Встреча прошла — предложить дату следующей' },
+        { command: 'another_time', description: 'Предложенное время не подходит — сдвинуть на неделю' }
+      ]
+    }),
+    muteHttpExceptions: true
+  });
+  Logger.log('setMyCommands: ' + commandsResponse.getContentText());
+}
+
 // ==================== СОЗДАНИЕ СПРИНТОВ ====================
 
 /**
