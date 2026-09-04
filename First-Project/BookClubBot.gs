@@ -11,7 +11,7 @@
 
 // Версия кода — чтобы командой /bot_version в Telegram проверять,
 // какая версия реально задеплоена (а не гадать, доехала ли вставка).
-const BOT_VERSION = '2026.09.04-2';
+const BOT_VERSION = '2026.09.04-3';
 
 // Настройки структуры таблицы (минимальные - остальное определяется автоматически)
 const CONFIG = {
@@ -590,19 +590,23 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isL
 /**
  * Отправить сообщение в Telegram
  */
-function sendTelegramMessage(message) {
+function sendTelegramMessage(message, parseMode = 'Markdown') {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
   const payload = {
     chat_id: TELEGRAM_CHAT_ID,
     text: message,
-    parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [[
         { text: '📊 Открыть таблицу', url: SpreadsheetApp.getActiveSpreadsheet().getUrl() }
       ]]
     }
   };
+  // Служебные сообщения с /командами (в них подчёркивания) шлём без Markdown —
+  // иначе Telegram отвечает "can't parse entities" и сообщение не уходит.
+  if (parseMode) {
+    payload.parse_mode = parseMode;
+  }
 
   const options = {
     method: 'post',
@@ -771,7 +775,10 @@ function handleAnotherTimeCommand() {
  * реально работает новая версия, а не старая.
  */
 function handleBotVersionCommand() {
-  sendTelegramMessage(`🤖 Бот книжного клуба, версия ${BOT_VERSION}\nКоманды: /meeting_done, /another_time, /bot_version`);
+  sendTelegramMessage(
+    `🤖 Бот книжного клуба, версия ${BOT_VERSION}\nКоманды: /meeting_done, /another_time, /bot_version`,
+    null // без Markdown: в командах подчёркивания
+  );
 }
 
 // ==================== ДОСТИЖЕНИЯ ====================
@@ -1132,12 +1139,25 @@ function markUpdateProcessed(updateId) {
   }
 
   try {
+    // Храним список последних обработанных update_id (а не "максимум"):
+    // так ни внеочередной, ни тестовый id не смогут заблокировать все
+    // последующие настоящие апдейты.
     const props = PropertiesService.getScriptProperties();
-    const lastId = Number(props.getProperty('lastTelegramUpdateId') || 0);
-    if (Number(updateId) <= lastId) {
+    let recent = [];
+    try {
+      recent = JSON.parse(props.getProperty('recentTelegramUpdateIds') || '[]');
+    } catch (err) {
+      recent = [];
+    }
+    const id = String(updateId);
+    if (recent.includes(id)) {
       return false;
     }
-    props.setProperty('lastTelegramUpdateId', String(updateId));
+    recent.push(id);
+    if (recent.length > 200) {
+      recent = recent.slice(recent.length - 200);
+    }
+    props.setProperty('recentTelegramUpdateIds', JSON.stringify(recent));
     return true;
   } finally {
     lock.releaseLock();

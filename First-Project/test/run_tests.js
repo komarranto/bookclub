@@ -177,7 +177,25 @@ test('/bot_version → одно сообщение с версией, без о�
   const botVersion = vm.runInContext('BOT_VERSION', ctx);
   assert.ok(botVersion && botVersion.length > 0, 'BOT_VERSION должна быть задана');
   assert.ok(msgs[0].payload.text.includes(botVersion), 'в ответе должна быть BOT_VERSION');
+  assert.strictEqual(msgs[0].payload.parse_mode, undefined, 'служебное сообщение с /командами — без Markdown (подчёркивания ломают парсинг)');
   assert.strictEqual(pollCalls(fetchCalls).length, 0);
+});
+
+test('Ежедневный отчёт по-прежнему уходит с Markdown', () => {
+  const { ctx, fetchCalls } = makeContext();
+  ctx.sendTelegramMessage('*test*');
+  assert.strictEqual(messageCalls(fetchCalls)[0].payload.parse_mode, 'Markdown');
+});
+
+test('Дедуп по списку последних update_id: старый/внеочередной id не блокирует новые', () => {
+  const { ctx, props, fetchCalls } = makeContext();
+  ctx.handleTelegramUpdate(telegramUpdate(999999999999, '/meeting_done')); // «тестовый» огромный id
+  assert.strictEqual(pollCalls(fetchCalls).length, 2);
+  props.set('lastMeetingCommandAt', String(Date.now() - 3 * 60 * 1000));
+  ctx.handleTelegramUpdate(telegramUpdate(100, '/meeting_done')); // настоящий маленький id — должен пройти
+  assert.strictEqual(pollCalls(fetchCalls).length, 4);
+  ctx.handleTelegramUpdate(telegramUpdate(100, '/meeting_done')); // повтор — нет
+  assert.strictEqual(pollCalls(fetchCalls).length, 4);
 });
 
 test('Неверный secret, чужой чат, сообщение без текста, обычный текст — ничего не отправляется', () => {
