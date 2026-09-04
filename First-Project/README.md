@@ -252,22 +252,36 @@ Group Privacy → Turn off). Команда `/meeting_done` работает в�
    → **Deploy**. Скопировать выданный адрес вида
    `https://script.google.com/macros/s/XXXXXXXX/exec`.
 3. Вписать этот адрес в `WEB_APP_URL` в `Config.gs`, сохранить.
-4. **Открыть этот адрес в обычном браузере один раз.** Покажется страница
-   Apps Script с текстом «Не удалось найти функцию скрипта: doGet» — это
-   нормально и ожидаемо (у бота только `doPost`). Без этого «прогрева»
-   Telegram нередко получает от Google `302 Found` вместо ответа и начинает
-   переотправлять сообщения по кругу.
-5. В редакторе выбрать функцию `setupTelegramWebhook` и нажать **Выполнить**
+4. В редакторе выбрать функцию `setupTelegramWebhook` и нажать **Выполнить**
    (аргументы не нужны — адрес берётся из `WEB_APP_URL`). В логе должно
    появиться `"ok":true` дважды — для `setWebhook` и для `setMyCommands`.
-6. Проверить: `/bot_version` в чате клуба → бот отвечает версией.
+5. Проверить: `/bot_version` в чате клуба → бот отвечает версией.
    Затем `/meeting_done` → приходят два опроса.
 
 **Важно и легко забыть:** если после этого правишь код — простого сохранения
 недостаточно. Нужно **Deploy → Manage deployments → значок карандаша у
 Web app → Version: New version → Deploy**. Адрес при этом не меняется,
 вебхук перенастраивать не нужно. Если же создать **New deployment** —
-адрес будет новый, и надо повторить шаги 3–5.
+адрес будет новый, и надо повторить шаги 3–4.
+
+**Почему `doPost` ничего не возвращает.** Если вернуть из `doPost`
+`ContentService.createTextOutput(...)`, Apps Script отдаёт этот текст через
+`302`-редирект на `script.googleusercontent.com`. Telegram по редиректам не
+ходит, считает доставку проваленной («Wrong response from the webhook: 302
+Found») и переотправляет апдейт снова и снова — так и рождались лавины
+одинаковых опросов. Пустой ответ Apps Script отдаёт напрямую с `200`, что
+Telegram и нужно. Не добавляйте `return` в `doPost`.
+
+#### Обновление кода через clasp (без копипаста)
+Проще всего обновлять бота утилитой Google `clasp`: она заливает файлы и
+выпускает новую версию деплоя из терминала, ничего не нужно вставлять руками.
+Разово: включить Apps Script API на https://script.google.com/home/usersettings,
+`npm install @google/clasp`, `clasp login`, `clasp clone <Script ID>`
+(Script ID — в настройках проекта). `Config.gs` живёт только в локальной
+папке clasp и в проекте Apps Script, в git не попадает. Дальше каждое
+обновление: скопировать `BookClubBot.gs` в `Бот.js`, `clasp push -f`,
+`clasp deploy -i <ID деплоя> -d "описание"` — ID деплоя показывает
+`clasp deployments`.
 
 ## Troubleshooting
 
@@ -301,16 +315,21 @@ Web app → Version: New version → Deploy**. Адрес при этом не �
    заново запустить настройку.
 5. Открой в браузере `https://api.telegram.org/bot<ТОКЕН>/getWebhookInfo`.
    Если там `"last_error_message":"Wrong response from the webhook: 302 Found"`
-   — открой `WEB_APP_URL` в браузере (шаг 4 настройки), затем снова запусти
-   `setupTelegramWebhook`. Если `pending_update_count` большой — сначала
-   сбрось очередь: `https://api.telegram.org/bot<ТОКЕН>/deleteWebhook?drop_pending_updates=true`,
+   — значит задеплоена старая версия, где `doPost` возвращал
+   `ContentService` (см. «Почему doPost ничего не возвращает»). Обнови код
+   и выпусти New version. Если `pending_update_count` большой — сбрось
+   очередь: `https://api.telegram.org/bot<ТОКЕН>/deleteWebhook?drop_pending_updates=true`,
    потом заново `setupTelegramWebhook`.
+6. Быстрая проверка снаружи: `curl -s -o /dev/null -w "%{http_code}" -X POST
+   -H "Content-Type: application/json" -d '{"update_id":1}' "<WEB_APP_URL>?secret=<секрет>"`
+   должно вернуть `200`. Если `302` — проблема из пункта 5.
 
 ### В чат прилетает много одинаковых опросов
-С версии `2026.09.04-1` такого быть не должно: повторы по `update_id`
-отсекаются, плюс 2-минутный cooldown. Если всё же случилось — напиши
-`/bot_version`: если бот молчит или отвечает старой версией, значит
-обновление не доехало (см. «New version» выше).
+С версии `2026.09.04-2` такого быть не должно: Telegram получает `200` и
+не переотправляет апдейты, повторы по `update_id` отсекаются, плюс
+2-минутный cooldown. Если всё же случилось — напиши `/bot_version`: если
+бот молчит или отвечает старой версией, значит обновление не доехало
+(см. «New version» выше).
 
 ## Лицензия
 

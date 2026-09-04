@@ -11,7 +11,7 @@
 
 // Версия кода — чтобы командой /bot_version в Telegram проверять,
 // какая версия реально задеплоена (а не гадать, доехала ли вставка).
-const BOT_VERSION = '2026.09.04-1';
+const BOT_VERSION = '2026.09.04-2';
 
 // Настройки структуры таблицы (минимальные - остальное определяется автоматически)
 const CONFIG = {
@@ -1044,10 +1044,28 @@ function removeAllTriggers() {
  * зарегистрирован через setupTelegramWebhook() — см. README, раздел
  * "Команды в Telegram".
  *
- * Всегда возвращает 200 OK (даже при внутренней ошибке) — иначе
- * Telegram будет бесконечно ретраить один и тот же апдейт.
+ * ВАЖНО: doPost намеренно НИЧЕГО не возвращает. Если вернуть
+ * ContentService.createTextOutput(...), Apps Script отдаёт результат через
+ * 302-редирект на script.googleusercontent.com, а Telegram по редиректам не
+ * ходит и считает доставку проваленной ("Wrong response from the webhook:
+ * 302 Found") — и переотправляет апдейт снова и снова. Пустой ответ Apps
+ * Script отдаёт напрямую с кодом 200, что Telegram и нужно.
  */
 function doPost(e) {
+  try {
+    handleTelegramUpdate(e);
+  } catch (error) {
+    Logger.log('❌ Ошибка в doPost: ' + error);
+  }
+  // намеренно без return — см. комментарий выше
+}
+
+/**
+ * Обработка одного апдейта Telegram. Вынесена из doPost, чтобы возвращать
+ * статус ('ok' / 'ignored' / 'error') для логов и локальных тестов,
+ * не влияя на HTTP-ответ вебхука.
+ */
+function handleTelegramUpdate(e) {
   try {
     // Проверяем секрет. Apps Script doPost(e) НЕ даёт доступа к HTTP-заголовкам
     // (ограничение платформы), поэтому секрет — часть самого URL вебхука
@@ -1055,31 +1073,30 @@ function doPost(e) {
     // сама). Отсекает посторонние запросы на публичный /exec-адрес.
     if (!e.parameter || e.parameter.secret !== TELEGRAM_WEBHOOK_SECRET) {
       Logger.log('⚠️ Отклонён запрос на вебхук с неверным secret');
-      return ContentService.createTextOutput('ignored');
+      return 'ignored';
     }
 
     const update = JSON.parse(e.postData.contents);
 
     // Защита от повторной доставки. Telegram может прислать один и тот же
-    // апдейт несколько раз (например, если ему не понравился наш ответ —
-    // классический "302 Found" у Apps Script). update_id у Telegram строго
-    // растёт, поэтому всё, что <= уже обработанного, — повтор, не команда.
+    // апдейт несколько раз. update_id у Telegram строго растёт, поэтому всё,
+    // что <= уже обработанного, — повтор, не команда.
     if (!markUpdateProcessed(update.update_id)) {
       Logger.log(`↩️ Повторная доставка update_id=${update.update_id} — пропускаю`);
-      return ContentService.createTextOutput('ok');
+      return 'ok';
     }
 
     const message = update.message;
 
     if (!message || !message.text) {
-      return ContentService.createTextOutput('ok');
+      return 'ok';
     }
 
     // Команды принимаем только из чата клуба — не реагируем на личные
     // сообщения боту от кого угодно
     if (String(message.chat.id) !== String(TELEGRAM_CHAT_ID)) {
       Logger.log(`⚠️ Команда из чужого чата (${message.chat.id}) проигнорирована`);
-      return ContentService.createTextOutput('ignored');
+      return 'ignored';
     }
 
     const text = message.text.trim();
@@ -1093,10 +1110,10 @@ function doPost(e) {
       handleBotVersionCommand();
     }
 
-    return ContentService.createTextOutput('ok');
+    return 'ok';
   } catch (error) {
-    Logger.log('❌ Ошибка в doPost: ' + error);
-    return ContentService.createTextOutput('error');
+    Logger.log('❌ Ошибка при обработке апдейта: ' + error);
+    return 'error';
   }
 }
 

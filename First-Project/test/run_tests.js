@@ -95,8 +95,8 @@ const DAY = 24 * 60 * 60 * 1000;
 
 test('/meeting_done → ровно два опроса: суббота и воскресенье через ~6 недель, по 10 слотов, мультивыбор', () => {
   const { ctx, fetchCalls } = makeContext();
-  const res = ctx.doPost(telegramUpdate(100, '/meeting_done'));
-  assert.strictEqual(res.text, 'ok');
+  const res = ctx.handleTelegramUpdate(telegramUpdate(100, '/meeting_done'));
+  assert.strictEqual(res, 'ok');
 
   const polls = pollCalls(fetchCalls);
   assert.strictEqual(polls.length, 2, `ожидалось 2 опроса, получено ${polls.length}`);
@@ -124,32 +124,32 @@ test('/meeting_done → ровно два опроса: суббота и вос
 
 test('Повторная доставка того же update_id — ни одного нового опроса', () => {
   const { ctx, fetchCalls } = makeContext();
-  ctx.doPost(telegramUpdate(100, '/meeting_done'));
+  ctx.handleTelegramUpdate(telegramUpdate(100, '/meeting_done'));
   assert.strictEqual(pollCalls(fetchCalls).length, 2);
-  for (let i = 0; i < 5; i++) ctx.doPost(telegramUpdate(100, '/meeting_done'));
+  for (let i = 0; i < 5; i++) ctx.handleTelegramUpdate(telegramUpdate(100, '/meeting_done'));
   assert.strictEqual(pollCalls(fetchCalls).length, 2, 'повторы update_id=100 не должны слать опросы');
   // и более старый update_id тоже игнорируется
-  ctx.doPost(telegramUpdate(99, '/meeting_done'));
+  ctx.handleTelegramUpdate(telegramUpdate(99, '/meeting_done'));
   assert.strictEqual(pollCalls(fetchCalls).length, 2);
 });
 
 test('Новая команда в течение cooldown — опросы не дублируются', () => {
   const { ctx, fetchCalls } = makeContext();
-  ctx.doPost(telegramUpdate(100, '/meeting_done'));
-  ctx.doPost(telegramUpdate(101, '/meeting_done'));
-  ctx.doPost(telegramUpdate(102, '/another_time'));
+  ctx.handleTelegramUpdate(telegramUpdate(100, '/meeting_done'));
+  ctx.handleTelegramUpdate(telegramUpdate(101, '/meeting_done'));
+  ctx.handleTelegramUpdate(telegramUpdate(102, '/another_time'));
   assert.strictEqual(pollCalls(fetchCalls).length, 2, 'в пределах 2 минут — только первая пара опросов');
 });
 
 test('/another_time после cooldown — новая пара опросов на неделю позже', () => {
   const { ctx, props, fetchCalls } = makeContext();
-  ctx.doPost(telegramUpdate(100, '/meeting_done'));
+  ctx.handleTelegramUpdate(telegramUpdate(100, '/meeting_done'));
   const firstSaturday = new Date(props.get('lastProposedMeetingDate'));
 
   // Имитируем, что прошло больше 2 минут
   props.set('lastMeetingCommandAt', String(Date.now() - 3 * 60 * 1000));
 
-  ctx.doPost(telegramUpdate(101, '/another_time'));
+  ctx.handleTelegramUpdate(telegramUpdate(101, '/another_time'));
   const polls = pollCalls(fetchCalls);
   assert.strictEqual(polls.length, 4, 'после cooldown должна уйти вторая пара опросов');
 
@@ -160,17 +160,17 @@ test('/another_time после cooldown — новая пара опросов �
 
 test('Команда с суффиксом @botname и текстовый триггер «встреча закончена» работают', () => {
   const { ctx, props, fetchCalls } = makeContext();
-  ctx.doPost(telegramUpdate(100, '/meeting_done@BookClubBot'));
+  ctx.handleTelegramUpdate(telegramUpdate(100, '/meeting_done@BookClubBot'));
   assert.strictEqual(pollCalls(fetchCalls).length, 2);
 
   props.set('lastMeetingCommandAt', String(Date.now() - 3 * 60 * 1000));
-  ctx.doPost(telegramUpdate(101, 'Встреча закончена'));
+  ctx.handleTelegramUpdate(telegramUpdate(101, 'Встреча закончена'));
   assert.strictEqual(pollCalls(fetchCalls).length, 4);
 });
 
 test('/bot_version → одно сообщение с версией, без опросов', () => {
   const { ctx, fetchCalls } = makeContext();
-  ctx.doPost(telegramUpdate(100, '/bot_version'));
+  ctx.handleTelegramUpdate(telegramUpdate(100, '/bot_version'));
   const msgs = messageCalls(fetchCalls);
   assert.strictEqual(msgs.length, 1);
   // top-level const в vm-контексте не является свойством ctx — читаем через eval в контексте
@@ -185,22 +185,31 @@ test('Неверный secret, чужой чат, сообщение без те
 
   const badSecret = telegramUpdate(100, '/meeting_done');
   badSecret.parameter.secret = 'wrong';
-  assert.strictEqual(ctx.doPost(badSecret).text, 'ignored');
+  assert.strictEqual(ctx.handleTelegramUpdate(badSecret), 'ignored');
 
-  assert.strictEqual(ctx.doPost(telegramUpdate(101, '/meeting_done', '-100999')).text, 'ignored');
+  assert.strictEqual(ctx.handleTelegramUpdate(telegramUpdate(101, '/meeting_done', '-100999')), 'ignored');
 
   const noText = { postData: { contents: JSON.stringify({ update_id: 102, message: { chat: { id: -1001234567890 } } }) }, parameter: { secret: 'test-secret' } };
-  assert.strictEqual(ctx.doPost(noText).text, 'ok');
+  assert.strictEqual(ctx.handleTelegramUpdate(noText), 'ok');
 
-  assert.strictEqual(ctx.doPost(telegramUpdate(103, 'привет, кто читает?')).text, 'ok');
+  assert.strictEqual(ctx.handleTelegramUpdate(telegramUpdate(103, 'привет, кто читает?')), 'ok');
 
   assert.strictEqual(fetchCalls.length, 0, 'ни одного запроса в Telegram');
 });
 
 test('Битый JSON не роняет вебхук (всегда отвечаем Telegram)', () => {
   const { ctx } = makeContext();
-  const res = ctx.doPost({ postData: { contents: '{not json' }, parameter: { secret: 'test-secret' } });
-  assert.strictEqual(res.text, 'error');
+  const res = ctx.handleTelegramUpdate({ postData: { contents: '{not json' }, parameter: { secret: 'test-secret' } });
+  assert.strictEqual(res, 'error');
+});
+
+test('doPost ничего не возвращает (иначе Apps Script отдаёт 302, который Telegram не принимает) и не бросает наружу', () => {
+  const { ctx, fetchCalls } = makeContext();
+  const res = ctx.doPost(telegramUpdate(100, '/meeting_done'));
+  assert.strictEqual(res, undefined, 'doPost должен возвращать undefined');
+  assert.strictEqual(pollCalls(fetchCalls).length, 2, 'при этом команда должна отработать');
+  assert.doesNotThrow(() => ctx.doPost({ postData: { contents: '{bad' }, parameter: { secret: 'test-secret' } }));
+  assert.doesNotThrow(() => ctx.doPost({}));
 });
 
 test('setupTelegramWebhook без аргумента берёт WEB_APP_URL и дописывает secret', () => {
