@@ -103,7 +103,10 @@ test('/meeting_done → ровно два опроса: суббота и вос
 
   for (const p of polls) {
     assert.strictEqual(p.payload.chat_id, '-1001234567890');
-    assert.strictEqual(p.payload.options.length, 10, 'в опросе должно быть ровно 10 слотов');
+    assert.strictEqual(p.payload.options.length, 12, 'в опросе должно быть ровно 12 слотов');
+    assert.strictEqual(p.payload.options[0], '07:00', 'первый слот — 07:00');
+    assert.ok(p.payload.question.includes('UTC+0'), 'в вопросе указан часовой пояс');
+    assert.ok(p.payload.question.length <= 300, 'вопрос опроса не длиннее 300 символов (лимит Telegram)');
     assert.strictEqual(p.payload.allows_multiple_answers, true, 'опрос должен быть с мультивыбором');
     assert.strictEqual(p.payload.is_anonymous, false);
   }

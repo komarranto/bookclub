@@ -11,7 +11,7 @@
 
 // Версия кода — чтобы командой /bot_version в Telegram проверять,
 // какая версия реально задеплоена (а не гадать, доехала ли вставка).
-const BOT_VERSION = '2026.09.04-3';
+const BOT_VERSION = '2026.09.04-4';
 
 // Настройки структуры таблицы (минимальные - остальное определяется автоматически)
 const CONFIG = {
@@ -53,9 +53,12 @@ const READING_QUOTES = [
 // Настройки предложения даты следующей офлайн-встречи клуба (команды /meeting_done, /another_time)
 const MEETING_INTERVAL_WEEKS = 6; // базовый интервал между встречами
 // На команду уходят ДВА опроса — отдельно на субботу и отдельно на воскресенье.
-// В каждом — ровно 10 слотов (это максимум вариантов в Telegram Poll),
-// равномерно с утра до вечера. Правится под привычки клуба.
-const MEETING_TIME_SLOTS = ['11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00'];
+// В каждом — 12 слотов (текущий максимум вариантов в Telegram Poll),
+// по часу с утра. Время — в MEETING_TIMEZONE_LABEL, это пишется в вопросе.
+// Правится под привычки клуба.
+const MEETING_TIME_SLOTS = ['07:00', '08:00', '09:00', '10:00', '11:00', '12:00',
+                            '13:00', '14:00', '15:00', '16:00', '17:00', '18:00'];
+const MEETING_TIMEZONE_LABEL = 'UTC+0';
 // Защита от дублей: если команду /meeting_done или /another_time уже
 // обработали недавно — новую не обрабатываем (случайное повторное нажатие,
 // несколько человек нажали одновременно и т.п.)
@@ -729,14 +732,9 @@ function proposeMeetingPolls(targetDate) {
 
     const { saturday, sunday } = getUpcomingWeekend(targetDate);
 
-    sendTelegramPoll(
-      `📅 Встреча клуба — ${formatDateRu(saturday)}. Какое время подходит? (можно выбрать несколько)`,
-      MEETING_TIME_SLOTS
-    );
-    sendTelegramPoll(
-      `📅 Встреча клуба — ${formatDateRu(sunday)}. Какое время подходит? (можно выбрать несколько)`,
-      MEETING_TIME_SLOTS
-    );
+    const questionTail = `Какое время подходит? Время — ${MEETING_TIMEZONE_LABEL}. Можно выбрать несколько.`;
+    sendTelegramPoll(`📅 Встреча клуба — ${formatDateRu(saturday)}. ${questionTail}`, MEETING_TIME_SLOTS);
+    sendTelegramPoll(`📅 Встреча клуба — ${formatDateRu(sunday)}. ${questionTail}`, MEETING_TIME_SLOTS);
 
     props.setProperty('lastProposedMeetingDate', saturday.toISOString());
 
