@@ -1,13 +1,17 @@
 // ==================== НАСТРОЙКИ ====================
-// Вставь сюда свои данные:
-const TELEGRAM_BOT_TOKEN = 'ВАШ_ТОКЕН_БОТА';  // Получить у @BotFather
-const TELEGRAM_CHAT_ID = 'ВАШ_CHAT_ID';        // ID чата или группы
+//
+// ⚠️ Токен бота, chat_id, секрет вебхука и URL веб-приложения живут в
+// ОТДЕЛЬНОМ файле Config.gs (в этом же проекте Apps Script) — см.
+// Config.example.gs. Так обновление этого файла никогда не затирает
+// ваши реальные значения: при апдейте бота заменяется только Bot.gs,
+// а Config.gs остаётся нетронутым.
+//
+// Ожидаемые константы в Config.gs:
+//   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_WEBHOOK_SECRET, WEB_APP_URL
 
-// Секрет для проверки вебхука (см. раздел "Команды в Telegram" в README).
-// Сгенерируй любую длинную случайную строку и используй её же при вызове
-// setupTelegramWebhook() — Telegram будет присылать её в каждом запросе,
-// так doPost() отличает реальные апдейты Telegram от чужих запросов на /exec.
-const TELEGRAM_WEBHOOK_SECRET = 'ВАШ_СЕКРЕТ_ВЕБХУКА';
+// Версия кода — чтобы командой /bot_version в Telegram проверять,
+// какая версия реально задеплоена (а не гадать, доехала ли вставка).
+const BOT_VERSION = '2026.09.04-1';
 
 // Настройки структуры таблицы (минимальные - остальное определяется автоматически)
 const CONFIG = {
@@ -48,13 +52,18 @@ const READING_QUOTES = [
 
 // Настройки предложения даты следующей офлайн-встречи клуба (команды /meeting_done, /another_time)
 const MEETING_INTERVAL_WEEKS = 6; // базовый интервал между встречами
-// Ровно 5 слотов, равномерно от утра до вечера — на каждый день выходных,
-// итого 5 + 5 = 10 вариантов, это максимум, который допускает Telegram Poll
-const MEETING_TIME_SLOTS = ['11:00', '13:30', '16:00', '18:30', '21:00'];
+// На команду уходят ДВА опроса — отдельно на субботу и отдельно на воскресенье.
+// В каждом — ровно 10 слотов (это максимум вариантов в Telegram Poll),
+// равномерно с утра до вечера. Правится под привычки клуба.
+const MEETING_TIME_SLOTS = ['11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00'];
 // Защита от дублей: если команду /meeting_done или /another_time уже
-// обработали недавно — новую не обрабатываем (спам из очереди Telegram,
-// случайное повторное нажатие и т.п. не должны присылать кучу опросов подряд)
+// обработали недавно — новую не обрабатываем (случайное повторное нажатие,
+// несколько человек нажали одновременно и т.п.)
 const MEETING_COMMAND_COOLDOWN_MS = 2 * 60 * 1000; // 2 минуты
+// Текстовые варианты команды «встреча прошла» (без слэша). Работают, только
+// если у бота выключен Privacy Mode в @BotFather — иначе Telegram не отдаёт
+// боту обычные сообщения из группы, только /команды.
+const MEETING_DONE_TEXT_TRIGGERS = ['встреча закончена', 'встреча прошла', 'встреча завершена'];
 
 // ==================== РАБОТА С ЛИСТАМИ ====================
 
@@ -677,48 +686,31 @@ function getUpcomingWeekend(targetDate) {
 }
 
 /**
- * Дата в формате "сб 20 авг" для вариантов опроса
+ * Дата в формате "суббота, 17 октября" для вопроса опроса
  */
-function formatShortDate(date) {
-  const weekdays = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
-  const months = ['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
-  return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]}`;
+function formatDateRu(date) {
+  const weekdays = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
+  const months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+                  'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+  return `${weekdays[date.getDay()]}, ${date.getDate()} ${months[date.getMonth()]}`;
 }
 
 /**
- * Построить ровно 10 вариантов ответа для опроса: суббота и воскресенье
- * ближайших к targetDate выходных, на каждый день — все MEETING_TIME_SLOTS
+ * Отправить ДВА опроса (суббота и воскресенье ближайших к targetDate
+ * выходных), в каждом — все MEETING_TIME_SLOTS с мультивыбором.
+ * Запоминает предложенную субботу в PropertiesService (без листов —
+ * это встроенное хранилище ключ-значение Apps Script), чтобы
+ * /another_time знал, от чего отсчитывать следующую неделю.
  */
-function buildMeetingPollOptions(targetDate) {
-  const { saturday, sunday } = getUpcomingWeekend(targetDate);
-  const options = [];
-
-  for (const day of [saturday, sunday]) {
-    for (const time of MEETING_TIME_SLOTS) {
-      options.push(`${formatShortDate(day)}, ${time}`);
-    }
-  }
-
-  return options;
-}
-
-/**
- * Отправить опрос с вариантами даты/времени встречи и запомнить
- * фактически предложенную субботу в PropertiesService (без листов —
- * это встроенное хранилище ключ-значение Apps Script, ничего не создаёт
- * в самой таблице), чтобы /another_time знал, от чего отсчитывать неделю.
- */
-function proposeMeetingPoll(targetDate) {
-  // LockService делает проверку и запись cooldown атомарными. Без лока
-  // несколько параллельных доставок doPost (Telegram может резко
-  // выгрузить пачку зависших сообщений разом) могли одновременно
-  // проверить "не рано ли" ДО того, как первый из них запишет новое
-  // время — и проскочить все разом, устроив спам одинаковых опросов.
+function proposeMeetingPolls(targetDate) {
+  // LockService делает проверку и запись cooldown атомарными — иначе
+  // несколько параллельных doPost могли одновременно пройти проверку
+  // "не рано ли" и все разом отправить свои опросы.
   const lock = LockService.getScriptLock();
   const gotLock = lock.tryLock(10000);
   if (!gotLock) {
-    Logger.log('⚠️ Не удалось получить блокировку для отправки опроса — пропускаю');
-    return;
+    Logger.log('⚠️ Не удалось получить блокировку для отправки опросов — пропускаю');
+    return false;
   }
 
   try {
@@ -727,31 +719,37 @@ function proposeMeetingPoll(targetDate) {
     const lastCommandAt = Number(props.getProperty('lastMeetingCommandAt') || 0);
     if (Date.now() - lastCommandAt < MEETING_COMMAND_COOLDOWN_MS) {
       Logger.log('⚠️ Команда встречи проигнорирована — слишком рано после предыдущей (защита от дублей)');
-      return;
+      return false;
     }
     props.setProperty('lastMeetingCommandAt', String(Date.now()));
 
     const { saturday, sunday } = getUpcomingWeekend(targetDate);
-    const question = `📅 Встреча книжного клуба — выбираем дату и время (${formatShortDate(saturday)} / ${formatShortDate(sunday)})`;
-    const options = buildMeetingPollOptions(targetDate);
 
-    sendTelegramPoll(question, options);
+    sendTelegramPoll(
+      `📅 Встреча клуба — ${formatDateRu(saturday)}. Какое время подходит? (можно выбрать несколько)`,
+      MEETING_TIME_SLOTS
+    );
+    sendTelegramPoll(
+      `📅 Встреча клуба — ${formatDateRu(sunday)}. Какое время подходит? (можно выбрать несколько)`,
+      MEETING_TIME_SLOTS
+    );
 
     props.setProperty('lastProposedMeetingDate', saturday.toISOString());
 
-    Logger.log(`📅 Предложены даты встречи: ${formatShortDate(saturday)} / ${formatShortDate(sunday)}`);
+    Logger.log(`📅 Предложены даты встречи: ${formatDateRu(saturday)} / ${formatDateRu(sunday)}`);
+    return true;
   } finally {
     lock.releaseLock();
   }
 }
 
 /**
- * Команда /meeting_done — «встреча прошла»: предложить даты через
- * MEETING_INTERVAL_WEEKS недель от сегодня.
+ * Команда /meeting_done (или текст «встреча закончена») — предложить
+ * даты через MEETING_INTERVAL_WEEKS недель от сегодня.
  */
 function handleMeetingDoneCommand() {
   const targetDate = new Date(Date.now() + MEETING_INTERVAL_WEEKS * 7 * 24 * 60 * 60 * 1000);
-  proposeMeetingPoll(targetDate);
+  return proposeMeetingPolls(targetDate);
 }
 
 /**
@@ -764,7 +762,16 @@ function handleAnotherTimeCommand() {
   const lastProposed = PropertiesService.getScriptProperties().getProperty('lastProposedMeetingDate');
   const baseDate = lastProposed ? new Date(lastProposed) : new Date();
   const targetDate = new Date(baseDate.getTime() + 7 * 24 * 60 * 60 * 1000);
-  proposeMeetingPoll(targetDate);
+  return proposeMeetingPolls(targetDate);
+}
+
+/**
+ * Команда /bot_version — ответить в чат версией задеплоенного кода.
+ * Нужна, чтобы после обновления за 5 секунд убедиться, что в Apps Script
+ * реально работает новая версия, а не старая.
+ */
+function handleBotVersionCommand() {
+  sendTelegramMessage(`🤖 Бот книжного клуба, версия ${BOT_VERSION}\nКоманды: /meeting_done, /another_time, /bot_version`);
 }
 
 // ==================== ДОСТИЖЕНИЯ ====================
@@ -1052,6 +1059,16 @@ function doPost(e) {
     }
 
     const update = JSON.parse(e.postData.contents);
+
+    // Защита от повторной доставки. Telegram может прислать один и тот же
+    // апдейт несколько раз (например, если ему не понравился наш ответ —
+    // классический "302 Found" у Apps Script). update_id у Telegram строго
+    // растёт, поэтому всё, что <= уже обработанного, — повтор, не команда.
+    if (!markUpdateProcessed(update.update_id)) {
+      Logger.log(`↩️ Повторная доставка update_id=${update.update_id} — пропускаю`);
+      return ContentService.createTextOutput('ok');
+    }
+
     const message = update.message;
 
     if (!message || !message.text) {
@@ -1066,11 +1083,14 @@ function doPost(e) {
     }
 
     const text = message.text.trim();
+    const textLower = text.toLowerCase();
 
-    if (text.startsWith('/meeting_done')) {
+    if (text.startsWith('/meeting_done') || MEETING_DONE_TEXT_TRIGGERS.some(t => textLower.startsWith(t))) {
       handleMeetingDoneCommand();
     } else if (text.startsWith('/another_time')) {
       handleAnotherTimeCommand();
+    } else if (text.startsWith('/bot_version')) {
+      handleBotVersionCommand();
     }
 
     return ContentService.createTextOutput('ok');
@@ -1081,16 +1101,54 @@ function doPost(e) {
 }
 
 /**
+ * Атомарно отметить update_id как обработанный.
+ * Возвращает true, если это новый апдейт (обрабатываем), и false, если
+ * такой (или более старый) уже был — то есть это повторная доставка.
+ */
+function markUpdateProcessed(updateId) {
+  if (updateId === undefined || updateId === null) return true; // нет id — не мешаем
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    Logger.log('⚠️ Не удалось получить блокировку для проверки update_id — считаю повтором');
+    return false;
+  }
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const lastId = Number(props.getProperty('lastTelegramUpdateId') || 0);
+    if (Number(updateId) <= lastId) {
+      return false;
+    }
+    props.setProperty('lastTelegramUpdateId', String(updateId));
+    return true;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
  * ⚙️ РАЗОВАЯ НАСТРОЙКА ВЕБХУКА
  * Запусти вручную один раз после того, как задеплоил скрипт как Web App
- * (Deploy → New deployment → Web app, Execute as: Me, Who has access: Anyone).
+ * (Deploy → New deployment → Web app, Execute as: Me, Who has access: Anyone)
+ * и вписал полученный .../exec адрес в WEB_APP_URL в Config.gs.
  *
- * webAppUrl — это тот самый .../exec адрес, который Apps Script выдаёт
- * после деплоя, БЕЗ query-параметров (функция сама дописывает ?secret=...
- * из TELEGRAM_WEBHOOK_SECRET). Вставь его как аргумент вызова из редактора —
- * сама функция URL нигде не хранит, только передаёт его в Telegram.
+ * Можно запускать прямо из выпадающего списка функций, без аргументов —
+ * адрес берётся из WEB_APP_URL. Функция сама дописывает ?secret=...
+ * из TELEGRAM_WEBHOOK_SECRET.
+ *
+ * ВАЖНО: перед запуском один раз открой WEB_APP_URL в обычном браузере.
+ * Должна показаться страница Apps Script с текстом про doGet — это нормально.
+ * Без этого "прогрева" Telegram иногда получает от Google 302 вместо ответа.
  */
 function setupTelegramWebhook(webAppUrl) {
+  if (!webAppUrl) {
+    webAppUrl = (typeof WEB_APP_URL === 'string') ? WEB_APP_URL : '';
+  }
+  if (!webAppUrl || webAppUrl.indexOf('script.google.com/macros/s/') === -1) {
+    throw new Error('WEB_APP_URL не задан. Впиши в Config.gs адрес вида https://script.google.com/macros/s/.../exec из Deploy → Manage deployments.');
+  }
+
   const separator = webAppUrl.includes('?') ? '&' : '?';
   const webhookUrlWithSecret = `${webAppUrl}${separator}secret=${encodeURIComponent(TELEGRAM_WEBHOOK_SECRET)}`;
 
@@ -1110,7 +1168,8 @@ function setupTelegramWebhook(webAppUrl) {
     payload: JSON.stringify({
       commands: [
         { command: 'meeting_done', description: 'Встреча прошла — предложить дату следующей' },
-        { command: 'another_time', description: 'Предложенное время не подходит — сдвинуть на неделю' }
+        { command: 'another_time', description: 'Предложенное время не подходит — сдвинуть на неделю' },
+        { command: 'bot_version', description: 'Какая версия бота сейчас работает' }
       ]
     }),
     muteHttpExceptions: true
