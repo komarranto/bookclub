@@ -11,7 +11,7 @@
 
 // Версия кода — чтобы командой /bot_version в Telegram проверять,
 // какая версия реально задеплоена (а не гадать, доехала ли вставка).
-const BOT_VERSION = '2026.09.04-4';
+const BOT_VERSION = '2026.10.01-1';
 
 // Настройки структуры таблицы (минимальные - остальное определяется автоматически)
 const CONFIG = {
@@ -67,6 +67,51 @@ const MEETING_COMMAND_COOLDOWN_MS = 2 * 60 * 1000; // 2 минуты
 // если у бота выключен Privacy Mode в @BotFather — иначе Telegram не отдаёт
 // боту обычные сообщения из группы, только /команды.
 const MEETING_DONE_TEXT_TRIGGERS = ['встреча закончена', 'встреча прошла', 'встреча завершена'];
+
+// ==================== ИГРОВЫЕ МЕХАНИКИ — НАСТРОЙКИ ====================
+// Подробности — в секции "ИГРОВЫЕ МЕХАНИКИ" ниже и в README.
+
+// Заморозка стрика (как в Duolingo): за каждые 7 дней стрика — одна
+// заморозка, она автоматически спасает стрик при пропущенном дне.
+const STREAK_FREEZE_EVERY_DAYS = 7;
+const STREAK_MAX_FREEZES = 2;          // больше двух копить нельзя
+// Сколько последних спринтов просматривать при подсчёте стрика —
+// ограничение, чтобы ежедневный отчёт не упирался в лимит времени Apps Script
+const STREAK_HISTORY_MAX_SHEETS = 12;
+
+// Камбэк: перерыв минимум 3 дня, потом минимум 3 дня чтения подряд
+const COMEBACK_MIN_GAP_DAYS = 3;
+const COMEBACK_MIN_RUN_DAYS = 3;
+
+// Дуэли
+const DUEL_LENGTH_DAYS = 7;
+const DUEL_ACCEPT_TIMEOUT_MS = 24 * 60 * 60 * 1000; // вызов действует сутки
+const DUEL_FORFEITS = [
+  'пишет в чат цитату из книги победителя',
+  'рассказывает в чате о своей книге в трёх предложениях',
+  'советует победителю книгу',
+  'выбирает десерт к следующей встрече'
+];
+
+// Тайные напарники и анонимные послания
+const SECRET_PARTNERS_MIN_MEMBERS = 3; // меньше трёх — какая уж тут тайна
+const ANON_DAILY_LIMIT = 5;            // анонимных посланий на человека в день
+
+// Пользовательский текст (цитаты, вопросы, послания, книги)
+const USER_TEXT_MAX_LENGTH = 500;
+// Голосование за следующую книгу
+const BOOK_VOTE_MAX_OPTIONS = 10;
+
+// Скрытые служебные листы с данными игровых механик
+// (имена не матчатся regex'ом Fortnight — в отчёт не попадают)
+const GAME_SHEETS = {
+  QUOTES: { name: 'Quotes', headers: ['Дата', 'Автор', 'Цитата', 'Показана'] },
+  QUESTIONS: { name: 'Questions', headers: ['Дата', 'Автор', 'Книга', 'Вопрос', 'Опубликован'] },
+  SUGGESTIONS: { name: 'BookSuggestions', headers: ['Дата', 'Автор', 'Книга', 'Статус'] }
+};
+
+const RU_MONTHS_GENITIVE = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+                            'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
 
 // ==================== РАБОТА С ЛИСТАМИ ====================
 
@@ -192,39 +237,94 @@ function findMemberColumn(sheet, memberName) {
 /**
  * Рассчитать стрик с учётом предыдущих спринтов
  * Ищем участника по ИМЕНИ на каждом листе (а не по номеру колонки)
- * Стрик считается от последнего отмеченного дня назад
+ * Стрик считается от последнего отмеченного дня назад.
+ * Учитывает заморозки — см. calculateStreakInfo.
  */
 function calculateStreak(memberName, fortnightSheets) {
-  let streak = 0;
-  let foundFirstTrue = false;
+  return calculateStreakInfo(memberName, fortnightSheets).streak;
+}
 
-  for (const sheetInfo of fortnightSheets) {
-    // Находим колонку участника по имени
+/**
+ * Стрик с заморозками.
+ *
+ * 1. Идём от сегодняшнего дня назад и по имени участника переходим на
+ *    предыдущие листы. Будущие дни текущего спринта не смотрим, сегодняшний
+ *    неотмеченный — тоже (ещё успеют отметить). А вот прошедший
+ *    неотмеченный день — это пропуск. (Раньше любые неотмеченные дни в
+ *    конце спринта считались будущими, и стрик не сгорал, даже если человек
+ *    перестал читать неделю назад.) Если даты в листе не читаются —
+ *    работает старое правило.
+ * 2. Собираем историю, пока не встретим перерыв длиннее, чем можно закрыть
+ *    заморозками (STREAK_MAX_FREEZES) — дальше стрик точно не тянется.
+ * 3. Проигрываем эту историю вперёд: каждые STREAK_FREEZE_EVERY_DAYS дней
+ *    стрика дают заморозку, пропущенный день съедает заморозку (стрик
+ *    сохраняется, но не растёт), без заморозки — стрик обнуляется.
+ *
+ * Без заработанных заморозок результат совпадает со старым подсчётом.
+ * Возвращает { streak, freezes (сколько осталось), freezesUsed (сколько
+ * пропусков закрыто заморозкой в текущем стрике) }.
+ */
+function calculateStreakInfo(memberName, fortnightSheets) {
+  const newestFirst = [];
+  let started = false;
+  let gap = 0;
+
+  outer:
+  for (let s = 0; s < fortnightSheets.length && s < STREAK_HISTORY_MAX_SHEETS; s++) {
+    const sheetInfo = fortnightSheets[s];
     const memberColumn = findMemberColumn(sheetInfo.sheet, memberName);
-
-    if (!memberColumn) {
-      // Участник не найден на этом листе — стрик прерывается
-      return streak;
-    }
+    if (!memberColumn) break; // участника нет на этом листе — история кончилась
 
     const daysCount = getSprintDaysCount(sheetInfo.sheet);
-    const checkboxes = getCheckboxesForMember(sheetInfo.sheet, memberColumn, daysCount);
+    let checkboxes = getCheckboxesForMember(sheetInfo.sheet, memberColumn, daysCount);
 
-    // Идём с конца листа к началу
+    // Текущий спринт с читаемыми датами: только наступившие дни
+    if (s === 0 && getDaysLeftInSprint(sheetInfo.sheet) >= 0) {
+      checkboxes = checkboxes.slice(0, getElapsedDaysCount(sheetInfo.sheet, daysCount));
+      if (checkboxes.length > 0 && checkboxes[checkboxes.length - 1] === false) {
+        checkboxes.pop(); // сегодня ещё не отметился — не пропуск
+      }
+      started = true; // дальше каждый неотмеченный день — пропуск
+    }
+
     for (let i = checkboxes.length - 1; i >= 0; i--) {
       if (checkboxes[i]) {
-        foundFirstTrue = true;
-        streak++;
-      } else if (foundFirstTrue) {
-        // Нашли false после true — стрик прервался
-        return streak;
+        started = true;
+        gap = 0;
+        newestFirst.push(true);
+      } else if (started) {
+        gap++;
+        if (gap > STREAK_MAX_FREEZES) break outer; // такой перерыв не закрыть
+        newestFirst.push(false);
       }
-      // Если ещё не нашли первый true — пропускаем false (будущие дни)
+      // ещё не встретили отмеченный день — это будущие дни, пропускаем
     }
-    // Весь лист заполнен — продолжаем к предыдущему
   }
 
-  return streak;
+  // Пропуски в самом начале истории ни на что не влияют
+  while (newestFirst.length > 0 && newestFirst[newestFirst.length - 1] === false) {
+    newestFirst.pop();
+  }
+
+  let streak = 0;
+  let freezes = 0;
+  let freezesUsed = 0;
+  for (let i = newestFirst.length - 1; i >= 0; i--) {
+    if (newestFirst[i]) {
+      streak++;
+      if (streak % STREAK_FREEZE_EVERY_DAYS === 0 && freezes < STREAK_MAX_FREEZES) {
+        freezes++;
+      }
+    } else if (freezes > 0) {
+      freezes--;
+      freezesUsed++;
+    } else {
+      streak = 0;
+      freezesUsed = 0;
+    }
+  }
+
+  return { streak, freezes, freezesUsed };
 }
 
 /**
@@ -242,15 +342,18 @@ function getReadingData(currentSheet, fortnightSheets) {
     const totalDays = checkboxes.length;
     const percentage = totalDays > 0 ? Math.round((daysRead / totalDays) * 100) : 0;
 
-    // Стрик — ищем по ИМЕНИ
-    const streak = calculateStreak(member.name, fortnightSheets);
+    // Стрик — ищем по ИМЕНИ (с учётом заморозок)
+    const streakInfo = calculateStreakInfo(member.name, fortnightSheets);
 
     results.push({
       name: member.name,
       daysRead: daysRead,
       totalDays: totalDays,
       percentage: percentage,
-      streak: streak
+      streak: streakInfo.streak,
+      freezes: streakInfo.freezes,
+      freezesUsed: streakInfo.freezesUsed,
+      checkboxes: checkboxes
     });
   }
 
@@ -462,7 +565,7 @@ function getDaysLeftInSprint(sheet) {
 /**
  * Сформировать еженедельное сообщение (красивый дизайн)
  */
-function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isLastDay = false, daysLeft = -1, previousAvg = null) {
+function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isLastDay = false, daysLeft = -1, previousAvg = null, memberQuote = null) {
   let msg = '';
 
   // Формируем строку с датой и оставшимися днями
@@ -523,9 +626,10 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isL
     const bar = createProgressBar(m.percentage, 8);
     const streakEmoji = getStreakEmoji(m.streak);
     const streakText = m.streak >= 3 ? ` ${streakEmoji}${m.streak}` : '';
+    const freezeText = m.freezes > 0 ? ` 🧊${m.freezes}` : '';
 
     msg += `│ ${medal} *${m.name}*\n`;
-    msg += `│    ${bar} ${m.percentage}% (${m.daysRead}/${m.totalDays})${streakText}\n`;
+    msg += `│    ${bar} ${m.percentage}% (${m.daysRead}/${m.totalDays})${streakText}${freezeText}\n`;
 
     // Разделитель между участниками (кроме последнего)
     if (i < readingData.length - 1) {
@@ -577,8 +681,14 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isL
 
   // Подпись
   msg += '═══════════════════════\n';
-  const quote = READING_QUOTES[Math.floor(Math.random() * READING_QUOTES.length)];
-  msg += `_${quote}_\n\n`;
+  if (memberQuote) {
+    // Цитата от участника (/quote). Текст уже очищен от символов Markdown
+    // при сохранении, но в курсив его не оборачиваем — так надёжнее.
+    msg += `💬 «${memberQuote.text}»\n— прислал(а) ${memberQuote.name}\n\n`;
+  } else {
+    const quote = READING_QUOTES[Math.floor(Math.random() * READING_QUOTES.length)];
+    msg += `_${quote}_\n\n`;
+  }
   msg += '    _Приятного чтения!_ 📖\n';
   if (isLastDay) {
     msg += '\n⚠️ *Внимание, последний день спринта!*\n';
@@ -593,18 +703,25 @@ function formatWeeklyMessage(readingData, booksData, commonBook, sprintName, isL
 /**
  * Отправить сообщение в Telegram
  */
-function sendTelegramMessage(message, parseMode = 'Markdown') {
+function sendTelegramMessage(message, parseMode = 'Markdown', extra = {}) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
+  // extra.chatId — написать не в чат клуба, а в личку участнику
+  // extra.noButton — без кнопки «Открыть таблицу» (короткие ответы на команды)
+  // extra.replyMarkup — своя клавиатура (например, кнопка «Принять дуэль»)
   const payload = {
-    chat_id: TELEGRAM_CHAT_ID,
-    text: message,
-    reply_markup: {
+    chat_id: extra.chatId || TELEGRAM_CHAT_ID,
+    text: message
+  };
+  if (extra.replyMarkup) {
+    payload.reply_markup = extra.replyMarkup;
+  } else if (!extra.noButton) {
+    payload.reply_markup = {
       inline_keyboard: [[
         { text: '📊 Открыть таблицу', url: SpreadsheetApp.getActiveSpreadsheet().getUrl() }
       ]]
-    }
-  };
+    };
+  }
   // Служебные сообщения с /командами (в них подчёркивания) шлём без Markdown —
   // иначе Telegram отвечает "can't parse entities" и сообщение не уходит.
   if (parseMode) {
@@ -639,7 +756,7 @@ function sendTelegramMessage(message, parseMode = 'Markdown') {
  * Отправить нативный Telegram Poll (опрос) — используется для выбора
  * даты/времени следующей встречи клуба (см. секцию "ВСТРЕЧИ КЛУБА")
  */
-function sendTelegramPoll(question, options) {
+function sendTelegramPoll(question, options, extra = {}) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPoll`;
 
   const payload = {
@@ -647,7 +764,8 @@ function sendTelegramPoll(question, options) {
     question: question,
     options: options,
     is_anonymous: false,
-    allows_multiple_answers: true
+    // по умолчанию мультивыбор (опросы встречи); голосование за книгу — один вариант
+    allows_multiple_answers: extra.allowsMultipleAnswers !== false
   };
 
   const requestOptions = {
@@ -774,7 +892,7 @@ function handleAnotherTimeCommand() {
  */
 function handleBotVersionCommand() {
   sendTelegramMessage(
-    `🤖 Бот книжного клуба, версия ${BOT_VERSION}\nКоманды: /meeting_done, /another_time, /bot_version`,
+    `🤖 Бот книжного клуба, версия ${BOT_VERSION}\nВсе команды: /help`,
     null // без Markdown: в командах подчёркивания
   );
 }
@@ -886,6 +1004,1222 @@ function formatNewBadgesMessage(newBadgesByMember) {
   return msg;
 }
 
+// ==================== ИГРОВЫЕ МЕХАНИКИ: ОБЩЕЕ ====================
+//
+// Что здесь живёт:
+// - /iam — привязка Telegram-аккаунта к имени в таблице (нужна дуэлям,
+//   тайным напарникам и анонимкам);
+// - /quote, /question, /questions, /suggest_book, /book_vote;
+// - дуэли (/duel + кнопка «Принять»), тайные напарники и /anon в личке;
+// - бейджи за прогресс (камбэк, первым дочитал, рывок) и секретные бейджи;
+// - церемония итогов спринта.
+//
+// Где хранятся данные:
+// - небольшое состояние (регистрации, дуэли, напарники, счётчики) —
+//   в PropertiesService в виде JSON;
+// - списки, которые растут (цитаты, вопросы, предложенные книги) —
+//   на скрытых листах GAME_SHEETS;
+// - выданные бейджи — на том же скрытом листе Achievements.
+
+function readJsonProperty(key, fallback) {
+  const raw = PropertiesService.getScriptProperties().getProperty(key);
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function writeJsonProperty(key, value) {
+  PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(value));
+}
+
+/**
+ * Выполнить fn под блокировкой скрипта (чтение-изменение-запись JSON в
+ * PropertiesService из параллельных вебхуков). Если блокировку получить
+ * не удалось — возвращает null и ничего не делает.
+ */
+function withScriptLock(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    Logger.log('⚠️ Не удалось получить блокировку — действие пропущено');
+    return null;
+  }
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Очистить текст от участника: убрать символы разметки Markdown
+ * (иначе Telegram не примет сообщение с отчётом целиком), обрезать длину.
+ */
+function sanitizeUserText(text, maxLength = USER_TEXT_MAX_LENGTH) {
+  return String(text || '')
+    .replace(/[*_`\[\]]/g, '')
+    .replace(/\r/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxLength)
+    .trim();
+}
+
+function truncateText(text, maxLength) {
+  const str = String(text);
+  return str.length > maxLength ? str.slice(0, maxLength - 1) + '…' : str;
+}
+
+/** Начало сегодняшнего дня (00:00) */
+function todayStart() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function addDays(date, days) {
+  const d = new Date(date.getTime());
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+/** Дата → 'YYYY-MM-DD' (удобно хранить и сравнивать строками) */
+function dateKey(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function dateFromKey(key) {
+  const parts = String(key).split('-').map(Number);
+  return new Date(parts[0], parts[1] - 1, parts[2]);
+}
+
+/** 'YYYY-MM-DD' → 'DD.MM' для сообщений */
+function shortDateFromKey(key) {
+  const d = dateFromKey(key);
+  return `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+/**
+ * Дата из ячейки колонки дат: настоящий Date (так пишет fillSprintDates)
+ * или текст вида '06.01.2026' / '06.01.26' (старые листы). Иначе null.
+ */
+function parseSheetDate(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    const d = new Date(value.getTime());
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  if (typeof value === 'string') {
+    const m = value.trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})$/);
+    if (m) {
+      let year = Number(m[3]);
+      if (year < 100) year += 2000;
+      const d = new Date(year, Number(m[2]) - 1, Number(m[1]));
+      return isNaN(d.getTime()) ? null : d;
+    }
+  }
+  return null;
+}
+
+/**
+ * Дата обсуждения общей книги: Date, '25.01.2026' или '25 января'.
+ * Для '25 января' без года берём ближайшую такую дату (не в далёком прошлом).
+ */
+function parseDiscussionDate(value) {
+  const direct = parseSheetDate(value);
+  if (direct) return direct;
+  if (typeof value !== 'string') return null;
+
+  const m = value.trim().toLowerCase().match(/^(\d{1,2})\s+([а-яё]+)(?:\s+(\d{4}))?/);
+  if (!m) return null;
+  const monthIndex = RU_MONTHS_GENITIVE.indexOf(m[2]);
+  if (monthIndex === -1) return null;
+
+  const today = todayStart();
+  const year = m[3] ? Number(m[3]) : today.getFullYear();
+  let d = new Date(year, monthIndex, Number(m[1]));
+  if (!m[3] && d.getTime() < addDays(today, -180).getTime()) {
+    d = new Date(year + 1, monthIndex, Number(m[1]));
+  }
+  return d;
+}
+
+/**
+ * Сколько дней спринта уже наступило (включая сегодня).
+ * Нужно, чтобы не считать будущие пустые дни «пропусками».
+ */
+function getElapsedDaysCount(sheet, daysCount) {
+  const daysLeft = getDaysLeftInSprint(sheet);
+  if (daysLeft < 0) return daysCount;
+  return Math.max(0, Math.min(daysCount, daysCount - daysLeft));
+}
+
+/** Универсальный вызов Bot API для служебных методов */
+function callTelegram(method, payload) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    const result = JSON.parse(response.getContentText());
+    if (!result.ok) {
+      Logger.log(`❌ Ошибка Telegram (${method}): ${result.description}`);
+    }
+    return result;
+  } catch (error) {
+    Logger.log(`❌ Ошибка (${method}): ${error}`);
+    return { ok: false };
+  }
+}
+
+/** Короткий ответ в чат клуба (без Markdown и без кнопки таблицы) */
+function sendChatText(text) {
+  return sendTelegramMessage(text, null, { noButton: true });
+}
+
+/** Сообщение в личку участнику */
+function sendPrivateText(chatId, text) {
+  return sendTelegramMessage(text, null, { chatId: chatId, noButton: true });
+}
+
+// ---------- Скрытые листы с данными ----------
+
+function getOrCreateDataSheet(def) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(def.name);
+  if (!sheet) {
+    sheet = ss.insertSheet(def.name);
+    sheet.getRange(1, 1, 1, def.headers.length).setValues([def.headers]);
+    sheet.hideSheet();
+  }
+  return sheet;
+}
+
+/**
+ * Прочитать строки данных одним запросом. Если листа ещё нет — пустой
+ * список (лист не создаём, чтобы чтение ничего не меняло в таблице).
+ * Каждая строка: { row (номер строки на листе), values }.
+ */
+function readDataRows(def) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(def.name);
+  if (!sheet) return [];
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  const values = sheet.getRange(2, 1, lastRow - 1, def.headers.length).getValues();
+  return values.map((v, i) => ({ row: i + 2, values: v }));
+}
+
+function appendDataRow(def, values) {
+  const sheet = getOrCreateDataSheet(def);
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, values.length).setValues([values]);
+}
+
+function setDataCell(def, row, column, value) {
+  getOrCreateDataSheet(def).getRange(row, column).setValue(value);
+}
+
+// ==================== /iam — КТО ЕСТЬ КТО ====================
+
+/** { telegramUserId: { name, username } } */
+function getRegisteredMembers() {
+  return readJsonProperty('telegramMembers', {});
+}
+
+function findRegisteredName(userId) {
+  if (userId === undefined || userId === null) return null;
+  const entry = getRegisteredMembers()[String(userId)];
+  return entry ? entry.name : null;
+}
+
+/** Имя автора для цитат/вопросов/книг: из /iam, иначе имя в Telegram */
+function getAuthorName(from) {
+  const registered = findRegisteredName(from && from.id);
+  if (registered) return registered;
+  const telegramName = sanitizeUserText(from && from.first_name, 50);
+  return telegramName || 'Участник клуба';
+}
+
+function getCurrentMemberNames() {
+  return getMembers(getCurrentSheet().sheet).map(m => m.name);
+}
+
+function handleIamCommand(from, args) {
+  if (!from || from.id === undefined) return;
+  const members = getCurrentMemberNames();
+  if (!args) {
+    sendChatText(`Напиши /iam и своё имя из таблицы, например: /iam ${members[0] || 'Антон'}\nИмена в таблице: ${members.join(', ')}`);
+    return;
+  }
+
+  const match = members.find(n => n.toLowerCase() === args.trim().toLowerCase());
+  if (!match) {
+    sendChatText(`Не нашёл «${sanitizeUserText(args, 50)}» в таблице. Имена в таблице: ${members.join(', ')}`);
+    return;
+  }
+
+  const result = withScriptLock(() => {
+    const registered = getRegisteredMembers();
+    const takenBy = Object.keys(registered).find(id => id !== String(from.id) && registered[id].name === match);
+    if (takenBy) return 'taken';
+    registered[String(from.id)] = { name: match, username: from.username || '' };
+    writeJsonProperty('telegramMembers', registered);
+    return 'ok';
+  });
+
+  if (result === 'taken') {
+    sendChatText(`Имя «${match}» уже привязано к другому аккаунту. Если это ошибка — пусть тот человек напишет /iam со своим именем.`);
+  } else if (result === 'ok') {
+    sendChatText(`👋 ${match}, готово! Теперь тебе доступны дуэли, тайные напарники и анонимки. Чтобы бот мог писать тебе в личку — открой его и нажми «Start».`);
+  }
+}
+
+// ==================== ЦИТАТЫ УЧАСТНИКОВ (/quote) ====================
+
+function handleQuoteCommand(author, args, reply) {
+  const text = sanitizeUserText(args);
+  if (!text) {
+    reply('Напиши цитату после команды: /quote Все счастливые семьи похожи друг на друга…');
+    return;
+  }
+  appendDataRow(GAME_SHEETS.QUOTES, [new Date(), author, text, false]);
+  reply('💬 Цитата сохранена — она появится в одном из ближайших отчётов.');
+}
+
+/**
+ * Взять самую старую непоказанную цитату участника и пометить показанной.
+ * null — если таких нет (тогда в отчёте будет случайная из READING_QUOTES).
+ */
+function pickMemberQuote() {
+  const rows = readDataRows(GAME_SHEETS.QUOTES);
+  const next = rows.find(r => r.values[3] !== true && String(r.values[2]).trim());
+  if (!next) return null;
+  setDataCell(GAME_SHEETS.QUOTES, next.row, 4, true);
+  return { name: sanitizeUserText(next.values[1], 50), text: sanitizeUserText(next.values[2]) };
+}
+
+// ==================== ВОПРОСЫ К ВСТРЕЧЕ (/question) ====================
+
+function getCurrentCommonBookTitle() {
+  return String(getCommonBookInfo(getCurrentSheet().sheet).title);
+}
+
+function getQuestionsForBook(bookTitle) {
+  return readDataRows(GAME_SHEETS.QUESTIONS)
+    .filter(r => String(r.values[2]) === String(bookTitle) && String(r.values[3]).trim());
+}
+
+function handleQuestionCommand(author, args, reply) {
+  const text = sanitizeUserText(args);
+  if (!text) {
+    reply('Напиши вопрос после команды: /question Почему герой так поступил в финале?');
+    return;
+  }
+  const book = getCurrentCommonBookTitle();
+  appendDataRow(GAME_SHEETS.QUESTIONS, [new Date(), author, book, text, false]);
+  const count = getQuestionsForBook(book).length;
+  reply(`❓ Вопрос к встрече по «${book}» сохранён (всего вопросов: ${count}). Список придёт в чат за день до обсуждения.`);
+}
+
+function formatQuestionsList(rows) {
+  let text = '';
+  rows.forEach((r, i) => {
+    const line = `${i + 1}. ${r.values[3]}\n`;
+    if (text.length + line.length < 3500) text += line;
+  });
+  return text;
+}
+
+function handleQuestionsListCommand() {
+  const book = getCurrentCommonBookTitle();
+  const rows = getQuestionsForBook(book);
+  if (rows.length === 0) {
+    sendChatText(`Вопросов к встрече по «${book}» пока нет. Добавить: /question текст вопроса`);
+    return;
+  }
+  sendChatText(`❓ Вопросы к встрече по «${book}»:\n\n${formatQuestionsList(rows)}\nДобавить ещё: /question текст вопроса`);
+}
+
+/**
+ * Если завтра — дата обсуждения общей книги, опубликовать вопросы,
+ * накопленные через /question (один раз — они помечаются опубликованными).
+ */
+function publishMeetingQuestionsIfDue(commonBook) {
+  const discussion = parseDiscussionDate(commonBook.discussionDate);
+  if (!discussion) return false;
+  if (dateKey(discussion) !== dateKey(addDays(todayStart(), 1))) return false;
+
+  const book = String(commonBook.title);
+  const rows = getQuestionsForBook(book).filter(r => r.values[4] !== true);
+  if (rows.length === 0) return false;
+
+  const result = sendChatText(`❓ Завтра обсуждаем «${book}»! Вопросы, которые вы накидали к встрече:\n\n${formatQuestionsList(rows)}\nДобавить ещё: /question текст вопроса`);
+  if (result && result.ok) {
+    for (const r of rows) setDataCell(GAME_SHEETS.QUESTIONS, r.row, 5, true);
+  }
+  return true;
+}
+
+// ==================== СЛЕДУЮЩАЯ КНИГА (/suggest_book, /book_vote) ====================
+
+function getOpenBookSuggestions() {
+  return readDataRows(GAME_SHEETS.SUGGESTIONS)
+    .filter(r => r.values[3] === 'open' && String(r.values[2]).trim());
+}
+
+function handleSuggestBookCommand(author, args, reply) {
+  const title = sanitizeUserText(args, 150);
+  if (!title) {
+    reply('Напиши название после команды: /suggest_book Мастер и Маргарита');
+    return;
+  }
+  const open = getOpenBookSuggestions();
+  if (open.some(r => String(r.values[2]).toLowerCase() === title.toLowerCase())) {
+    reply(`📚 «${title}» уже есть в списке кандидатов.`);
+    return;
+  }
+  appendDataRow(GAME_SHEETS.SUGGESTIONS, [new Date(), author, title, 'open']);
+  reply(`📚 «${title}» добавлена в кандидаты на следующую общую книгу (всего: ${open.length + 1}). Голосование — в конце спринта или командой /book_vote.`);
+}
+
+/**
+ * Запустить опрос «какую книгу читаем следующей» из открытых предложений.
+ * Возвращает { launched, count }.
+ */
+function launchBookVote() {
+  const open = getOpenBookSuggestions();
+  if (open.length < 2) return { launched: false, count: open.length };
+
+  const chosen = open.slice(0, BOOK_VOTE_MAX_OPTIONS);
+  const options = chosen.map(r => truncateText(`${r.values[2]} (от ${r.values[1]})`, 100));
+  const result = sendTelegramPoll('📚 Какую книгу читаем следующей общей?', options, { allowsMultipleAnswers: false });
+
+  if (result && result.ok) {
+    for (const r of chosen) setDataCell(GAME_SHEETS.SUGGESTIONS, r.row, 4, 'voted');
+    return { launched: true, count: chosen.length };
+  }
+  return { launched: false, count: open.length };
+}
+
+function handleBookVoteCommand() {
+  const result = launchBookVote();
+  if (!result.launched) {
+    sendChatText(`Для голосования нужно минимум 2 кандидата, сейчас: ${result.count}. Предлагайте: /suggest_book название`);
+  }
+}
+
+// ==================== ДУЭЛИ ====================
+//
+// /duel Имя (или /duel @username) — вызов. Под сообщением кнопка
+// «Принять» — нажать может только вызванный. Дуэль длится
+// DUEL_LENGTH_DAYS дней с дня принятия: кто больше дней отметит чтение.
+// Итоги подводит ежедневный отчёт на следующий день после окончания.
+
+function getDuels() {
+  return readJsonProperty('duels', []);
+}
+
+function isMemberInActiveDuel(duels, name) {
+  return duels.some(d => d.status === 'active' && (d.a === name || d.b === name));
+}
+
+function resolveDuelTarget(args) {
+  const raw = args.trim();
+  if (raw.startsWith('@')) {
+    const username = raw.slice(1).toLowerCase();
+    const registered = getRegisteredMembers();
+    const id = Object.keys(registered).find(k => (registered[k].username || '').toLowerCase() === username);
+    return id ? registered[id].name : null;
+  }
+  return getCurrentMemberNames().find(n => n.toLowerCase() === raw.toLowerCase()) || null;
+}
+
+function handleDuelCommand(from, args) {
+  const challenger = findRegisteredName(from.id);
+  if (!challenger) {
+    sendChatText('Чтобы вызывать на дуэль, сначала представься: /iam Имя');
+    return;
+  }
+  if (!args) {
+    sendChatText(`Кого вызываем? Например: /duel ${getCurrentMemberNames().find(n => n !== challenger) || 'Маша'}`);
+    return;
+  }
+  const target = resolveDuelTarget(args);
+  if (!target) {
+    sendChatText(`Не нашёл «${sanitizeUserText(args, 50)}» в таблице. Вызывать можно по имени из таблицы или по @username того, кто сделал /iam.`);
+    return;
+  }
+  if (target === challenger) {
+    sendChatText('С самим собой дуэль всегда заканчивается ничьёй 🙂 Выбери соперника.');
+    return;
+  }
+
+  const duel = withScriptLock(() => {
+    const duels = getDuels();
+    if (isMemberInActiveDuel(duels, challenger) || isMemberInActiveDuel(duels, target)) {
+      return 'busy';
+    }
+    const created = {
+      id: String(Date.now()) + String(Math.floor(Math.random() * 1000)),
+      a: challenger,
+      b: target,
+      status: 'pending',
+      createdAt: Date.now()
+    };
+    duels.push(created);
+    writeJsonProperty('duels', pruneDuels(duels));
+    return created;
+  });
+
+  if (duel === 'busy') {
+    sendChatText('У кого-то из вас уже идёт дуэль — дождитесь её итогов.');
+    return;
+  }
+  if (!duel) return;
+
+  sendTelegramMessage(
+    `⚔️ ${challenger} вызывает ${target} на дуэль!\n\n` +
+    `${DUEL_LENGTH_DAYS} дней: кто больше дней почитает. Проигравший выполняет фант.\n` +
+    `${target}, вызов действует сутки.`,
+    null,
+    { replyMarkup: { inline_keyboard: [[{ text: '⚔️ Принять вызов', callback_data: 'duel_accept:' + duel.id }]] } }
+  );
+}
+
+/** Оставить активные, ожидающие (не протухшие) и 30 последних завершённых */
+function pruneDuels(duels) {
+  const now = Date.now();
+  const alive = duels.filter(d => d.status === 'active' || (d.status === 'pending' && now - d.createdAt <= DUEL_ACCEPT_TIMEOUT_MS));
+  const finished = duels.filter(d => d.status === 'finished').slice(-30);
+  return alive.concat(finished);
+}
+
+function acceptDuel(duelId, from) {
+  const name = findRegisteredName(from && from.id);
+
+  const result = withScriptLock(() => {
+    const duels = getDuels();
+    const duel = duels.find(d => d.id === duelId);
+    if (!duel || duel.status === 'expired') return { answer: 'Вызов не найден или устарел' };
+    if (duel.status !== 'pending') return { answer: 'Эта дуэль уже идёт или завершена' };
+    if (!name || name !== duel.b) return { answer: `Этот вызов адресован ${duel.b} 🙂` };
+    if (Date.now() - duel.createdAt > DUEL_ACCEPT_TIMEOUT_MS) {
+      duel.status = 'expired';
+      writeJsonProperty('duels', pruneDuels(duels));
+      return { answer: 'Вызов устарел — пусть вызовут заново' };
+    }
+    if (isMemberInActiveDuel(duels, duel.a) || isMemberInActiveDuel(duels, duel.b)) {
+      return { answer: 'У кого-то из вас уже идёт другая дуэль' };
+    }
+
+    const start = todayStart();
+    duel.status = 'active';
+    duel.start = dateKey(start);
+    duel.end = dateKey(addDays(start, DUEL_LENGTH_DAYS - 1));
+    writeJsonProperty('duels', pruneDuels(duels));
+    return { answer: 'Вызов принят! ⚔️', started: duel };
+  });
+
+  if (!result) return 'Попробуй ещё раз через минуту';
+  if (result.started) {
+    const d = result.started;
+    sendChatText(`⚔️ Дуэль началась: ${d.a} против ${d.b}!\nСчитаем дни чтения с ${shortDateFromKey(d.start)} по ${shortDateFromKey(d.end)}. Проигравший выполняет фант. Удачи!`);
+  }
+  return result.answer;
+}
+
+/**
+ * Сколько разных дней с startKey по endKey участник отметил чтение.
+ * Смотрим 3 последних листа — дуэль короче спринта, этого хватает.
+ */
+function countReadDaysInRange(memberName, startKey, endKey, fortnightSheets) {
+  const readDays = new Set();
+  for (const sheetInfo of fortnightSheets.slice(0, 3)) {
+    const column = findMemberColumn(sheetInfo.sheet, memberName);
+    if (!column) continue;
+    const daysCount = getSprintDaysCount(sheetInfo.sheet);
+    if (daysCount === 0) continue;
+    const dates = sheetInfo.sheet.getRange(CONFIG.checkboxesStartRow, CONFIG.datesColumn, daysCount, 1).getValues();
+    const checks = getCheckboxesForMember(sheetInfo.sheet, column, daysCount);
+    for (let i = 0; i < daysCount; i++) {
+      const date = parseSheetDate(dates[i][0]);
+      if (!date || !checks[i]) continue;
+      const key = dateKey(date);
+      if (key >= startKey && key <= endKey) readDays.add(key);
+    }
+  }
+  return readDays.size;
+}
+
+/** Подвести итоги дуэлей, которые закончились до сегодняшнего дня */
+function resolveFinishedDuels(fortnightSheets, current) {
+  const todayKey = dateKey(todayStart());
+
+  const finishedNow = withScriptLock(() => {
+    const duels = getDuels();
+    const done = [];
+    for (const duel of duels) {
+      if (duel.status !== 'active' || !(duel.end < todayKey)) continue;
+      duel.scoreA = countReadDaysInRange(duel.a, duel.start, duel.end, fortnightSheets);
+      duel.scoreB = countReadDaysInRange(duel.b, duel.start, duel.end, fortnightSheets);
+      duel.winner = duel.scoreA > duel.scoreB ? duel.a : duel.scoreB > duel.scoreA ? duel.b : null;
+      duel.status = 'finished';
+      duel.finishedSprint = current.name;
+      done.push(duel);
+    }
+    if (done.length > 0) {
+      writeJsonProperty('duels', pruneDuels(duels));
+      const wins = readJsonProperty('duelWins', {});
+      for (const duel of done) {
+        if (duel.winner) wins[duel.winner] = (wins[duel.winner] || 0) + 1;
+      }
+      writeJsonProperty('duelWins', wins);
+    }
+    return done;
+  }) || [];
+
+  for (const duel of finishedNow) {
+    let text = `⚔️ Итоги дуэли ${duel.a} vs ${duel.b}: ${duel.scoreA}:${duel.scoreB}\n\n`;
+    if (duel.winner) {
+      const loser = duel.winner === duel.a ? duel.b : duel.a;
+      const forfeit = DUEL_FORFEITS[Math.floor(Math.random() * DUEL_FORFEITS.length)];
+      text += `🏆 Победа — ${duel.winner}!\n🎲 Фант для ${loser}: ${forfeit}.`;
+    } else {
+      text += '🤝 Ничья! Оба молодцы — фанта нет.';
+    }
+    sendChatText(text);
+  }
+  return finishedNow;
+}
+
+// ==================== ТАЙНЫЕ НАПАРНИКИ И АНОНИМКИ ====================
+//
+// В первый отчёт нового спринта бот случайно назначает каждому
+// зарегистрированному (/iam) участнику «подопечного» — по кругу, так что у
+// каждого ровно один тайный напарник. Бот пишет каждому в личку, кого он
+// опекает. Послания подопечному — в личке боту: /anon текст. Бот публикует
+// их в чате клуба без имени отправителя. На церемонии итогов пары
+// раскрываются. /anon_all — анонимное послание всему клубу.
+
+function getSecretPartners() {
+  return readJsonProperty('secretPartners', null);
+}
+
+/** Назначение на текущий спринт или null, если его нет */
+function getActiveSecretPartners() {
+  const assignment = getSecretPartners();
+  if (!assignment) return null;
+  return assignment.sprint === getCurrentSheet().name ? assignment : null;
+}
+
+function ensureSecretPartners(sprintName, memberNames) {
+  const assignment = withScriptLock(() => {
+    const existing = getSecretPartners();
+    if (existing && existing.sprint === sprintName) return null;
+
+    const registered = getRegisteredMembers();
+    const participants = Object.keys(registered)
+      .filter(id => memberNames.includes(registered[id].name))
+      .map(id => ({ id: id, name: registered[id].name }));
+    if (participants.length < SECRET_PARTNERS_MIN_MEMBERS) return null;
+
+    // Перемешиваем (Фишер–Йетс) и замыкаем в круг: каждый опекает следующего
+    for (let i = participants.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = participants[i];
+      participants[i] = participants[j];
+      participants[j] = tmp;
+    }
+    const pairs = participants.map((p, i) => {
+      const target = participants[(i + 1) % participants.length];
+      return { giverId: p.id, giverName: p.name, targetId: target.id, targetName: target.name, sent: 0 };
+    });
+
+    const created = { sprint: sprintName, pairs: pairs };
+    writeJsonProperty('secretPartners', created);
+    return created;
+  });
+
+  if (!assignment) return false;
+
+  for (const pair of assignment.pairs) {
+    sendPrivateText(pair.giverId,
+      `🎭 В спринте ${assignment.sprint} ты — тайный книжный напарник для ${pair.targetName}!\n\n` +
+      'Поддерживай подопечного анонимно: цитата специально для него, вопрос про его книгу, рекомендация.\n' +
+      'Пиши сюда: /anon текст — бот опубликует это в чате клуба без твоего имени.\n' +
+      'В конце спринта все пары раскроются 😉');
+  }
+  sendChatText(
+    `🎭 Тайные напарники на ${assignment.sprint} назначены!\n\n` +
+    'У каждого есть тайный опекун, который будет анонимно писать ему через бота. Кому ты напарник — бот написал в личку ' +
+    '(если не пришло — открой бота и отправь /my_target). В конце спринта всех раскроем!');
+  return true;
+}
+
+function handleMyTargetCommand(chatId, userId) {
+  const assignment = getActiveSecretPartners();
+  const pair = assignment && assignment.pairs.find(p => p.giverId === String(userId));
+  if (!pair) {
+    sendPrivateText(chatId, 'Тайные напарники ещё не назначены. Они назначаются автоматически в начале спринта, когда в клубе минимум 3 человека сделали /iam. А пока можно написать всему клубу анонимно: /anon_all текст');
+    return;
+  }
+  sendPrivateText(chatId, `🎭 В спринте ${assignment.sprint} ты тайный напарник для ${pair.targetName}. Написать анонимно: /anon текст`);
+}
+
+/**
+ * Анонимное послание. toAll = false — подопечному (если назначен),
+ * иначе — всему клубу. Лимит ANON_DAILY_LIMIT посланий в день на человека.
+ */
+function handleAnonCommand(chatId, userId, senderName, args, toAll) {
+  const text = sanitizeUserText(args);
+  if (!text) {
+    sendPrivateText(chatId, toAll
+      ? 'Напиши текст после команды: /anon_all Всем хорошего чтения!'
+      : 'Напиши текст после команды: /anon Держи цитату специально для тебя: …');
+    return;
+  }
+
+  const sprintName = getCurrentSheet().name;
+  const today = dateKey(todayStart());
+
+  const prepared = withScriptLock(() => {
+    const daily = readJsonProperty('anonDailyCounts', { date: today, counts: {} });
+    if (daily.date !== today) {
+      daily.date = today;
+      daily.counts = {};
+    }
+    const used = daily.counts[String(userId)] || 0;
+    if (used >= ANON_DAILY_LIMIT) return { limit: true };
+    daily.counts[String(userId)] = used + 1;
+    writeJsonProperty('anonDailyCounts', daily);
+
+    const stats = readJsonProperty('anonStats', { sprint: sprintName, counts: {} });
+    if (stats.sprint !== sprintName) {
+      stats.sprint = sprintName;
+      stats.counts = {};
+    }
+    stats.counts[senderName] = (stats.counts[senderName] || 0) + 1;
+    writeJsonProperty('anonStats', stats);
+
+    let targetName = null;
+    if (!toAll) {
+      const assignment = getSecretPartners();
+      if (assignment && assignment.sprint === sprintName) {
+        const pair = assignment.pairs.find(p => p.giverId === String(userId));
+        if (pair) {
+          pair.sent = (pair.sent || 0) + 1;
+          targetName = pair.targetName;
+          writeJsonProperty('secretPartners', assignment);
+        }
+      }
+    }
+    return { targetName: targetName };
+  });
+
+  if (!prepared) {
+    sendPrivateText(chatId, 'Не получилось отправить, попробуй ещё раз через минуту.');
+    return;
+  }
+  if (prepared.limit) {
+    sendPrivateText(chatId, `На сегодня лимит анонимок исчерпан (${ANON_DAILY_LIMIT} в день). Завтра — снова можно!`);
+    return;
+  }
+
+  const groupText = prepared.targetName
+    ? `📨 ${prepared.targetName}, тебе послание от тайного напарника:\n\n«${text}»`
+    : `📨 Анонимное послание клубу:\n\n«${text}»`;
+  const result = sendChatText(groupText);
+
+  if (result && result.ok) {
+    sendPrivateText(chatId, prepared.targetName
+      ? `✅ Отправлено анонимно для ${prepared.targetName}.`
+      : '✅ Отправлено в чат клуба анонимно.');
+  } else {
+    sendPrivateText(chatId, 'Telegram не принял сообщение, попробуй ещё раз.');
+  }
+}
+
+// ==================== ВХОДЯЩИЕ СООБЩЕНИЯ ====================
+
+/** '/cmd@BotName аргументы' → { command: 'cmd', args: 'аргументы' } */
+function parseCommand(text) {
+  const m = String(text).match(/^\/([a-zA-Z_]+)(?:@\S+)?(?:\s+([\s\S]*))?$/);
+  if (!m) return null;
+  return { command: m[1].toLowerCase(), args: (m[2] || '').trim() };
+}
+
+function groupHelpText() {
+  return '📚 Команды книжного клуба\n\n' +
+    '/iam Имя — привязать свой Telegram к имени в таблице (один раз)\n' +
+    '/quote текст — цитата из твоей книги, появится в отчёте\n' +
+    '/question текст — вопрос к встрече по общей книге\n' +
+    '/questions — вопросы к встрече\n' +
+    '/suggest_book название — предложить следующую общую книгу\n' +
+    '/book_vote — голосование за следующую книгу\n' +
+    '/duel Имя — вызвать на дуэль на 7 дней\n' +
+    '/meeting_done, /another_time — дата следующей встречи\n' +
+    '/bot_version — версия бота\n\n' +
+    '🤫 Анонимно — только в личке с ботом:\n' +
+    '/anon текст — послание тайному подопечному\n' +
+    '/anon_all текст — послание всему клубу\n' +
+    '/my_target — кому ты тайный напарник';
+}
+
+function privateHelpText(registeredName) {
+  let text = '🤫 Здесь можно писать в чат клуба анонимно:\n\n' +
+    '/anon текст — послание твоему подопечному (ты его тайный напарник)\n' +
+    '/anon_all текст — анонимное послание всему клубу\n' +
+    '/my_target — кому ты тайный напарник в этом спринте\n\n' +
+    'И тихо, без сообщения в чате, отправить:\n' +
+    '/quote текст — цитату для отчёта\n' +
+    '/question текст — вопрос к встрече\n' +
+    '/suggest_book название — книгу-кандидата';
+  if (!registeredName) {
+    text += '\n\n⚠️ Сначала представься в чате клуба: /iam Имя (как в таблице).';
+  }
+  return text;
+}
+
+function handleGroupMessage(message) {
+  const text = message.text.trim();
+  const textLower = text.toLowerCase();
+  const from = message.from || {};
+  const cmd = parseCommand(text);
+  const reply = (t) => sendChatText(t);
+
+  if ((cmd && cmd.command === 'meeting_done') || MEETING_DONE_TEXT_TRIGGERS.some(t => textLower.startsWith(t))) {
+    handleMeetingDoneCommand();
+    return;
+  }
+  if (!cmd) return;
+
+  switch (cmd.command) {
+    case 'another_time': handleAnotherTimeCommand(); break;
+    case 'bot_version': handleBotVersionCommand(); break;
+    case 'help': sendChatText(groupHelpText()); break;
+    case 'iam': handleIamCommand(from, cmd.args); break;
+    case 'quote': handleQuoteCommand(getAuthorName(from), cmd.args, reply); break;
+    case 'question': handleQuestionCommand(getAuthorName(from), cmd.args, reply); break;
+    case 'questions': handleQuestionsListCommand(); break;
+    case 'suggest_book': handleSuggestBookCommand(getAuthorName(from), cmd.args, reply); break;
+    case 'book_vote': handleBookVoteCommand(); break;
+    case 'duel': handleDuelCommand(from, cmd.args); break;
+    case 'anon':
+    case 'anon_all':
+    case 'my_target':
+      // В общем чате анонимности нет — пробуем убрать сообщение и подсказываем
+      callTelegram('deleteMessage', { chat_id: message.chat.id, message_id: message.message_id });
+      sendChatText('🤫 Анонимно писать нужно в личку боту — там /anon текст. Сообщение в общем чате все видят!');
+      break;
+    default:
+      break;
+  }
+}
+
+function handlePrivateMessage(message) {
+  const chatId = message.chat.id;
+  const from = message.from || {};
+  const cmd = parseCommand(message.text.trim());
+  const name = findRegisteredName(from.id);
+  const reply = (t) => sendPrivateText(chatId, t);
+
+  if (!cmd || cmd.command === 'start' || cmd.command === 'help') {
+    reply(privateHelpText(name));
+    return;
+  }
+  if (!name) {
+    reply('Сначала представься в чате клуба: /iam Имя (как в таблице). После этого здесь заработают анонимки.');
+    return;
+  }
+
+  switch (cmd.command) {
+    case 'anon': handleAnonCommand(chatId, from.id, name, cmd.args, false); break;
+    case 'anon_all': handleAnonCommand(chatId, from.id, name, cmd.args, true); break;
+    case 'my_target': handleMyTargetCommand(chatId, from.id); break;
+    case 'quote': handleQuoteCommand(name, cmd.args, reply); break;
+    case 'question': handleQuestionCommand(name, cmd.args, reply); break;
+    case 'suggest_book': handleSuggestBookCommand(name, cmd.args, reply); break;
+    default: reply(privateHelpText(name)); break;
+  }
+}
+
+/** Нажатия на inline-кнопки. Сейчас это только «Принять дуэль». */
+function handleCallbackQuery(callbackQuery) {
+  const chatId = callbackQuery.message && callbackQuery.message.chat && callbackQuery.message.chat.id;
+  if (String(chatId) !== String(TELEGRAM_CHAT_ID)) {
+    Logger.log('⚠️ Нажатие кнопки из чужого чата проигнорировано');
+    return 'ignored';
+  }
+
+  const data = String(callbackQuery.data || '');
+  let answer = '';
+  if (data.startsWith('duel_accept:')) {
+    answer = acceptDuel(data.slice('duel_accept:'.length), callbackQuery.from);
+  }
+  callTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: answer });
+  return 'ok';
+}
+
+// ==================== БЕЙДЖИ ЗА ПРОГРЕСС И СЕКРЕТНЫЕ БЕЙДЖИ ====================
+
+const GAME_BADGES = {
+  COMEBACK: '🔄 Камбэк',
+  FIRST_FINISH: '🏁 Первым дочитал общую книгу',
+  BREAKTHROUGH: '🚀 Рывок спринта'
+};
+
+/**
+ * Секретные бейджи: в чате объявляется только название, условие — нет.
+ * Каждый выдаётся один раз за всё время.
+ * c = { checks (наступившие дни спринта), settled (без сегодняшнего
+ *       неотмеченного дня), dates, member, isLastDay, stats }
+ */
+const SECRET_BADGES = [
+  {
+    // 6 дней подряд строго через день: читал / не читал / читал …
+    title: '🎢 Американские горки',
+    check: (c) => {
+      const x = c.settled;
+      for (let i = 0; i + 5 < x.length; i++) {
+        let alternating = true;
+        for (let j = i; j < i + 5; j++) {
+          if (x[j] === x[j + 1]) { alternating = false; break; }
+        }
+        if (alternating) return true;
+      }
+      return false;
+    }
+  },
+  {
+    // Первые 3 дня спринта пропущены, последние 3 — отмечены
+    title: '🌅 Сильный финиш',
+    check: (c) => {
+      const x = c.checks;
+      return c.isLastDay && x.length >= 6 &&
+        x.slice(0, 3).every(v => !v) && x.slice(-3).every(v => v);
+    }
+  },
+  {
+    // Все наступившие выходные дни спринта (минимум 4) отмечены
+    title: '🏖 Выходной читатель',
+    check: (c) => {
+      let weekendDays = 0;
+      for (let i = 0; i < c.settled.length; i++) {
+        const d = c.dates[i];
+        if (!d || (d.getDay() !== 0 && d.getDay() !== 6)) continue;
+        if (!c.settled[i]) return false;
+        weekendDays++;
+      }
+      return weekendDays >= 4;
+    }
+  },
+  {
+    // Ровно половина дней спринта
+    title: '⚖️ Золотая середина',
+    check: (c) => c.isLastDay && c.member.totalDays > 0 && c.member.daysRead * 2 === c.member.totalDays
+  },
+  {
+    title: '🧊 Ледяное сердце', // стрик спасла заморозка
+    check: (c) => c.member.freezesUsed > 0
+  },
+  {
+    title: '💬 Цитатник', // 3+ цитаты через /quote
+    check: (c) => (c.stats.quotes[c.member.name] || 0) >= 3
+  },
+  {
+    title: '🤔 Почемучка', // 3+ вопроса через /question
+    check: (c) => (c.stats.questions[c.member.name] || 0) >= 3
+  },
+  {
+    title: '📮 Почтальон', // 3+ анонимки за спринт
+    check: (c) => (c.stats.anon[c.member.name] || 0) >= 3
+  },
+  {
+    title: '🗡 Гладиатор', // 3 выигранные дуэли
+    check: (c) => (c.stats.duelWins[c.member.name] || 0) >= 3
+  }
+];
+
+function countByAuthor(rows, authorIndex) {
+  const counts = {};
+  for (const r of rows) {
+    const author = String(r.values[authorIndex]);
+    counts[author] = (counts[author] || 0) + 1;
+  }
+  return counts;
+}
+
+function collectMemberActivityStats(sprintName) {
+  const anonStats = readJsonProperty('anonStats', null);
+  return {
+    quotes: countByAuthor(readDataRows(GAME_SHEETS.QUOTES), 1),
+    questions: countByAuthor(readDataRows(GAME_SHEETS.QUESTIONS), 1),
+    anon: anonStats && anonStats.sprint === sprintName ? anonStats.counts : {},
+    duelWins: readJsonProperty('duelWins', {})
+  };
+}
+
+/**
+ * Камбэк: в конце истории — минимум COMEBACK_MIN_RUN_DAYS дней чтения
+ * подряд, перед ними — перерыв минимум COMEBACK_MIN_GAP_DAYS дней,
+ * а ещё раньше человек уже читал (новичок — не камбэк).
+ * history — массив true/false по дням, от старых к новым.
+ */
+function isComeback(history) {
+  const h = history.slice();
+  // Сегодня ещё могут отметиться — неотмеченный сегодняшний день не считаем
+  if (h.length > 0 && h[h.length - 1] === false) h.pop();
+
+  let i = h.length - 1;
+  let run = 0;
+  while (i >= 0 && h[i]) { run++; i--; }
+  if (run < COMEBACK_MIN_RUN_DAYS) return false;
+
+  let gap = 0;
+  while (i >= 0 && !h[i]) { gap++; i--; }
+  return gap >= COMEBACK_MIN_GAP_DAYS && i >= 0;
+}
+
+/**
+ * Начислить бейджи за прогресс (камбэк, первым дочитал общую книгу)
+ * и секретные бейджи. Хранятся на листе Achievements, как и остальные.
+ * Возвращает { progress: [{name, badges}], secret: [{name, badge}] }.
+ */
+function awardGameBadges(readingData, current, fortnightSheets, booksData, commonBook, isLastDay) {
+  const sheet = getOrCreateAchievementsSheet(SpreadsheetApp.getActiveSpreadsheet());
+  const existing = readExistingAchievements(sheet);
+  const hasForSprint = (name, badge, sprint) =>
+    existing.some(r => r.name === name && r.badge === badge && r.sprint === sprint);
+  const hasEver = (name, badge) =>
+    existing.some(r => r.name === name && r.badge === badge);
+
+  const newRows = [];
+  const progress = [];
+  const secret = [];
+  const addProgress = (name, badge, sprintKey) => {
+    newRows.push([name, badge, sprintKey]);
+    const entry = progress.find(p => p.name === name);
+    if (entry) entry.badges.push(badge);
+    else progress.push({ name: name, badges: [badge] });
+  };
+
+  const daysCount = getSprintDaysCount(current.sheet);
+  const elapsed = getElapsedDaysCount(current.sheet, daysCount);
+  const dates = daysCount > 0
+    ? current.sheet.getRange(CONFIG.checkboxesStartRow, CONFIG.datesColumn, daysCount, 1).getValues().map(r => parseSheetDate(r[0]))
+    : [];
+  const previous = fortnightSheets.length > 1 ? fortnightSheets[1] : null;
+  const stats = collectMemberActivityStats(current.name);
+
+  for (const member of readingData) {
+    const allChecks = member.checkboxes || [];
+    const checks = allChecks.slice(0, elapsed);
+    const settled = checks.slice();
+    if (settled.length > 0 && settled[settled.length - 1] === false) settled.pop();
+
+    // 🔄 Камбэк — раз за спринт; перерыв может начаться ещё в прошлом спринте
+    if (!hasForSprint(member.name, GAME_BADGES.COMEBACK, current.name)) {
+      let history = checks;
+      if (previous) {
+        const column = findMemberColumn(previous.sheet, member.name);
+        if (column) history = getCheckboxesForMember(previous.sheet, column).concat(checks);
+      }
+      if (isComeback(history)) addProgress(member.name, GAME_BADGES.COMEBACK, current.name);
+    }
+
+    // 🔮 Секретные бейджи — раз за всё время
+    const context = { checks, settled, dates, member, isLastDay, stats };
+    for (const badge of SECRET_BADGES) {
+      if (hasEver(member.name, badge.title)) continue;
+      let earned = false;
+      try {
+        earned = badge.check(context);
+      } catch (error) {
+        Logger.log(`⚠️ Ошибка проверки бейджа ${badge.title}: ${error}`);
+      }
+      if (earned) {
+        newRows.push([member.name, badge.title, current.name]);
+        secret.push({ name: member.name, badge: badge.title });
+      }
+    }
+  }
+
+  // 🏁 Первым дочитал общую книгу — раз на книгу. Если в один день
+  // дочитали несколько человек — бейдж получают все они.
+  const bookTitle = String(commonBook.title || '').trim();
+  if (bookTitle && bookTitle !== 'Не указана') {
+    const bookKey = 'Книга: ' + bookTitle;
+    const alreadyAwarded = existing.some(r => r.badge === GAME_BADGES.FIRST_FINISH && r.sprint === bookKey);
+    if (!alreadyAwarded) {
+      for (const b of booksData.filter(x => x.finishedCommonBook)) {
+        addProgress(b.name, GAME_BADGES.FIRST_FINISH, bookKey);
+      }
+    }
+  }
+
+  if (newRows.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, 3).setValues(newRows);
+  }
+
+  return { progress, secret };
+}
+
+/** Объединить два списка [{name, badges}] по имени */
+function mergeBadgeLists(a, b) {
+  const result = a.map(e => ({ name: e.name, badges: e.badges.slice() }));
+  for (const entry of b) {
+    const existing = result.find(e => e.name === entry.name);
+    if (existing) existing.badges.push(...entry.badges);
+    else result.push({ name: entry.name, badges: entry.badges.slice() });
+  }
+  return result;
+}
+
+function formatSecretBadgesMessage(secretBadges) {
+  let msg = '🔮 *Секретные бейджи!*\n\n';
+  for (const entry of secretBadges) {
+    msg += `👤 *${entry.name}* получает «${entry.badge}»\n`;
+  }
+  msg += '\nЗа что их дают — угадайте сами 😏';
+  return msg;
+}
+
+// ==================== ЦЕРЕМОНИЯ ИТОГОВ СПРИНТА ====================
+
+/** Процент прочтения участника на листе (по имени) или null */
+function getMemberPercentOnSheet(memberName, sheetInfo) {
+  const column = findMemberColumn(sheetInfo.sheet, memberName);
+  if (!column) return null;
+  const checks = getCheckboxesForMember(sheetInfo.sheet, column);
+  if (checks.length === 0) return null;
+  return Math.round((checks.filter(x => x).length / checks.length) * 100);
+}
+
+function pluralRu(n, one, few, many) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return few;
+  return many;
+}
+
+/**
+ * Праздничный пост в последний день спринта: MVP, рывок (бейдж выдаётся
+ * здесь), самый длинный стрик, камбэки, первым дочитал, дуэли, раскрытие
+ * тайных напарников, секретные бейджи.
+ */
+function sendSprintCeremony(readingData, current, fortnightSheets, commonBook) {
+  if (readingData.length === 0) return false;
+
+  const lines = [];
+  lines.push(`🎊 *ИТОГИ СПРИНТА — ${current.name}* 🎊`);
+  lines.push('');
+
+  // 👑 MVP — максимальный процент (при равенстве — все)
+  const topPercent = Math.max(...readingData.map(m => m.percentage));
+  const mvps = readingData.filter(m => m.percentage === topPercent);
+  lines.push(`👑 *MVP:* ${mvps.map(m => m.name).join(', ')} — ${topPercent}% (${mvps[0].daysRead}/${mvps[0].totalDays})`);
+
+  const achievementsSheet = getOrCreateAchievementsSheet(SpreadsheetApp.getActiveSpreadsheet());
+  const existing = readExistingAchievements(achievementsSheet);
+
+  // 🚀 Рывок — самый большой рост процента к прошлому спринту
+  if (fortnightSheets.length > 1) {
+    let best = 0;
+    let breakthroughs = [];
+    for (const m of readingData) {
+      const before = getMemberPercentOnSheet(m.name, fortnightSheets[1]);
+      if (before === null) continue;
+      const delta = m.percentage - before;
+      if (delta > best) {
+        best = delta;
+        breakthroughs = [m.name];
+      } else if (delta === best && delta > 0) {
+        breakthroughs.push(m.name);
+      }
+    }
+    if (best > 0) {
+      lines.push(`🚀 *Рывок спринта:* ${breakthroughs.join(', ')} (+${best}% к прошлому спринту)`);
+      const newRows = breakthroughs
+        .filter(name => !existing.some(r => r.name === name && r.badge === GAME_BADGES.BREAKTHROUGH && r.sprint === current.name))
+        .map(name => [name, GAME_BADGES.BREAKTHROUGH, current.name]);
+      if (newRows.length > 0) {
+        achievementsSheet.getRange(achievementsSheet.getLastRow() + 1, 1, newRows.length, 3).setValues(newRows);
+      }
+    }
+  }
+
+  // 🔥 Самый длинный стрик
+  const topStreak = Math.max(...readingData.map(m => m.streak));
+  if (topStreak >= 3) {
+    const streakers = readingData.filter(m => m.streak === topStreak).map(m => m.name);
+    lines.push(`🔥 *Самый длинный стрик:* ${streakers.join(', ')} — ${topStreak} ${pluralRu(topStreak, 'день', 'дня', 'дней')}`);
+  }
+
+  // 🔄 Камбэки этого спринта
+  const comebacks = existing.filter(r => r.badge === GAME_BADGES.COMEBACK && r.sprint === current.name).map(r => r.name);
+  if (comebacks.length > 0) {
+    lines.push(`🔄 *Камбэк:* ${comebacks.join(', ')}`);
+  }
+
+  // 🏁 Первым дочитал общую книгу
+  const bookKey = 'Книга: ' + String(commonBook.title || '').trim();
+  const firstFinishers = existing.filter(r => r.badge === GAME_BADGES.FIRST_FINISH && r.sprint === bookKey).map(r => r.name);
+  if (firstFinishers.length > 0) {
+    lines.push(`🏁 *Первым дочитал общую книгу:* ${firstFinishers.join(', ')}`);
+  }
+
+  // ⚔️ Дуэли, закончившиеся в этом спринте
+  const duels = getDuels().filter(d => d.status === 'finished' && d.finishedSprint === current.name);
+  if (duels.length > 0) {
+    lines.push('');
+    lines.push('⚔️ *Дуэли спринта:*');
+    for (const d of duels) {
+      lines.push(d.winner
+        ? `   ${d.winner} победил(а) ${d.winner === d.a ? d.b : d.a} — ${Math.max(d.scoreA, d.scoreB)}:${Math.min(d.scoreA, d.scoreB)}`
+        : `   ${d.a} и ${d.b} — ничья ${d.scoreA}:${d.scoreB}`);
+    }
+  }
+
+  // 🎭 Раскрываем тайных напарников
+  const partners = getSecretPartners();
+  if (partners && partners.sprint === current.name) {
+    lines.push('');
+    lines.push('🎭 *Тайные напарники раскрыты:*');
+    for (const p of partners.pairs) {
+      const sent = p.sent || 0;
+      lines.push(`   ${p.giverName} → ${p.targetName} (${sent} ${pluralRu(sent, 'послание', 'послания', 'посланий')})`);
+    }
+  }
+
+  // 🔮 Секретные бейджи спринта — только количество, интрига остаётся
+  const secretTitles = SECRET_BADGES.map(b => b.title);
+  const secretCount = existing.filter(r => r.sprint === current.name && secretTitles.includes(r.badge)).length;
+  if (secretCount > 0) {
+    lines.push('');
+    lines.push(`🔮 Секретных бейджей за спринт: ${secretCount}`);
+  }
+
+  lines.push('');
+  const openSuggestions = getOpenBookSuggestions().length;
+  if (openSuggestions >= 2) {
+    lines.push('📚 Ниже — голосование за следующую общую книгу 👇');
+  } else {
+    lines.push('📚 Предлагайте следующую общую книгу: /suggest\\_book название');
+  }
+  lines.push('Спасибо всем за спринт! Новый начинается завтра 📖');
+
+  sendTelegramMessage(lines.join('\n'));
+  return true;
+}
+
 // ==================== ГЛАВНЫЕ ФУНКЦИИ ====================
 
 /**
@@ -906,20 +2240,89 @@ function sendWeeklyReport() {
   // Предыдущий спринт — это следующий элемент в отсортированном по убыванию списке
   const previousAvg = fortnightSheets.length > 1 ? getSprintAveragePercent(fortnightSheets[1]) : null;
 
-  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay, daysLeft, previousAvg);
+  // Цитата от участника (/quote) вместо случайной — если есть непоказанные
+  let memberQuote = null;
+  try {
+    memberQuote = pickMemberQuote();
+  } catch (error) {
+    Logger.log('⚠️ Ошибка при выборе цитаты участника: ' + error);
+  }
+
+  const message = formatWeeklyMessage(readingData, booksData, commonBook, current.name, isLastDay, daysLeft, previousAvg, memberQuote);
 
   Logger.log('\n--- СООБЩЕНИЕ ---\n' + message);
 
   sendTelegramMessage(message);
 
+  // Всё ниже — дополнительные механики. Каждая в своём try/catch:
+  // ошибка в одной не должна ронять остальные и тем более отчёт.
+
   // Начисление бейджей — не должно ронять отправку отчёта, если что-то пойдёт не так
+  let newBadges = [];
   try {
-    const newBadges = awardBadges(readingData, current, isLastDay);
+    newBadges = awardBadges(readingData, current, isLastDay);
+  } catch (error) {
+    Logger.log('⚠️ Ошибка при начислении бейджей: ' + error);
+  }
+
+  // Бейджи за прогресс (камбэк, первым дочитал) и секретные бейджи
+  let secretBadges = [];
+  try {
+    const game = awardGameBadges(readingData, current, fortnightSheets, booksData, commonBook, isLastDay);
+    newBadges = mergeBadgeLists(newBadges, game.progress);
+    secretBadges = game.secret;
+  } catch (error) {
+    Logger.log('⚠️ Ошибка при начислении игровых бейджей: ' + error);
+  }
+
+  try {
     if (newBadges.length > 0) {
       sendTelegramMessage(formatNewBadgesMessage(newBadges));
     }
+    if (secretBadges.length > 0) {
+      sendTelegramMessage(formatSecretBadgesMessage(secretBadges));
+    }
   } catch (error) {
-    Logger.log('⚠️ Ошибка при начислении бейджей: ' + error);
+    Logger.log('⚠️ Ошибка при отправке бейджей: ' + error);
+  }
+
+  // Вопросы к встрече — за день до даты обсуждения общей книги
+  try {
+    publishMeetingQuestionsIfDue(commonBook);
+  } catch (error) {
+    Logger.log('⚠️ Ошибка при публикации вопросов к встрече: ' + error);
+  }
+
+  // Подвести итоги закончившихся дуэлей (до церемонии — чтобы попали в неё)
+  try {
+    resolveFinishedDuels(fortnightSheets, current);
+  } catch (error) {
+    Logger.log('⚠️ Ошибка при подведении итогов дуэлей: ' + error);
+  }
+
+  // Тайные напарники назначаются в первый же отчёт нового спринта.
+  // В последний день не назначаем — их тут же пришлось бы раскрывать.
+  if (!isLastDay) {
+    try {
+      ensureSecretPartners(current.name, readingData.map(m => m.name));
+    } catch (error) {
+      Logger.log('⚠️ Ошибка при назначении тайных напарников: ' + error);
+    }
+  }
+
+  if (isLastDay) {
+    // Церемония итогов спринта — отдельным постом после отчёта
+    try {
+      sendSprintCeremony(readingData, current, fortnightSheets, commonBook);
+    } catch (error) {
+      Logger.log('⚠️ Ошибка при отправке итогов спринта: ' + error);
+    }
+    // Голосование за следующую общую книгу из предложенных через /suggest_book
+    try {
+      launchBookVote();
+    } catch (error) {
+      Logger.log('⚠️ Ошибка при запуске голосования за книгу: ' + error);
+    }
   }
 
   // Автоматически создаём новый спринт в последний день
@@ -1084,11 +2487,16 @@ function handleTelegramUpdate(e) {
     const update = JSON.parse(e.postData.contents);
 
     // Защита от повторной доставки. Telegram может прислать один и тот же
-    // апдейт несколько раз. update_id у Telegram строго растёт, поэтому всё,
-    // что <= уже обработанного, — повтор, не команда.
+    // апдейт несколько раз — уже обработанные update_id пропускаем
+    // (храним список последних, см. markUpdateProcessed).
     if (!markUpdateProcessed(update.update_id)) {
       Logger.log(`↩️ Повторная доставка update_id=${update.update_id} — пропускаю`);
       return 'ok';
+    }
+
+    // Нажатие на кнопку под сообщением (например, «Принять дуэль»)
+    if (update.callback_query) {
+      return handleCallbackQuery(update.callback_query);
     }
 
     const message = update.message;
@@ -1097,23 +2505,22 @@ function handleTelegramUpdate(e) {
       return 'ok';
     }
 
-    // Команды принимаем только из чата клуба — не реагируем на личные
-    // сообщения боту от кого угодно
+    // Личка с ботом — только для анонимных посланий и тихой отправки
+    // цитат/вопросов/книг. Пишут туда только участники, которые
+    // представились в чате клуба через /iam (см. handlePrivateMessage).
+    if (message.chat && message.chat.type === 'private') {
+      handlePrivateMessage(message);
+      return 'ok';
+    }
+
+    // Команды принимаем только из чата клуба — не реагируем на
+    // сообщения из чужих групп
     if (String(message.chat.id) !== String(TELEGRAM_CHAT_ID)) {
       Logger.log(`⚠️ Команда из чужого чата (${message.chat.id}) проигнорирована`);
       return 'ignored';
     }
 
-    const text = message.text.trim();
-    const textLower = text.toLowerCase();
-
-    if (text.startsWith('/meeting_done') || MEETING_DONE_TEXT_TRIGGERS.some(t => textLower.startsWith(t))) {
-      handleMeetingDoneCommand();
-    } else if (text.startsWith('/another_time')) {
-      handleAnotherTimeCommand();
-    } else if (text.startsWith('/bot_version')) {
-      handleBotVersionCommand();
-    }
+    handleGroupMessage(message);
 
     return 'ok';
   } catch (error) {
@@ -1204,12 +2611,40 @@ function setupTelegramWebhook(webAppUrl) {
       commands: [
         { command: 'meeting_done', description: 'Встреча прошла — предложить дату следующей' },
         { command: 'another_time', description: 'Предложенное время не подходит — сдвинуть на неделю' },
-        { command: 'bot_version', description: 'Какая версия бота сейчас работает' }
+        { command: 'bot_version', description: 'Какая версия бота сейчас работает' },
+        { command: 'iam', description: 'Привязать свой Telegram к имени в таблице' },
+        { command: 'quote', description: 'Цитата из своей книги — попадёт в отчёт' },
+        { command: 'question', description: 'Вопрос к встрече по общей книге' },
+        { command: 'questions', description: 'Список вопросов к встрече' },
+        { command: 'suggest_book', description: 'Предложить следующую общую книгу' },
+        { command: 'book_vote', description: 'Голосование за следующую общую книгу' },
+        { command: 'duel', description: 'Вызвать на дуэль на 7 дней' },
+        { command: 'help', description: 'Все команды бота' }
       ]
     }),
     muteHttpExceptions: true
   });
   Logger.log('setMyCommands: ' + commandsResponse.getContentText());
+
+  // Отдельное меню команд для лички с ботом
+  const privateCommandsResponse = UrlFetchApp.fetch(setCommandsUrl, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({
+      scope: { type: 'all_private_chats' },
+      commands: [
+        { command: 'anon', description: 'Анонимное послание тайному напарнику' },
+        { command: 'anon_all', description: 'Анонимное послание всему клубу' },
+        { command: 'my_target', description: 'Кому я тайный напарник' },
+        { command: 'quote', description: 'Цитата из своей книги — попадёт в отчёт' },
+        { command: 'question', description: 'Вопрос к встрече по общей книге' },
+        { command: 'suggest_book', description: 'Предложить следующую общую книгу' },
+        { command: 'help', description: 'Что умеет бот' }
+      ]
+    }),
+    muteHttpExceptions: true
+  });
+  Logger.log('setMyCommands (личка): ' + privateCommandsResponse.getContentText());
 }
 
 // ==================== СОЗДАНИЕ СПРИНТОВ ====================
