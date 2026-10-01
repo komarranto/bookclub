@@ -470,6 +470,50 @@ test('Стрик сгорает, если человек перестал чит
   assert.strictEqual(vasya.freezesUsed, 1);
 });
 
+test('Лист следующего спринта создан заранее (все даты в будущем) — стрик не ломается', () => {
+  const future = makeSprintSheet('Fortnight 99', {
+    startOffset: 1,
+    members: [{ name: 'Антон', checks: [] }, { name: 'Маша', checks: [] }, { name: 'Вася', checks: [] }]
+  });
+  const { ctx, ss } = clubContext({
+    currentStartOffset: -13, // сегодня последний день Fortnight 98
+    current: [
+      { name: 'Антон', checks: [F, F, F, F, F, F, F, F, F, T, T, T, T, F] }, // 4 дня, сегодня не отмечено
+      { name: 'Маша', checks: [] }, { name: 'Вася', checks: [] }
+    ],
+    extraSheets: [future]
+  });
+  assert.strictEqual(ctx.getFortnightSheets()[0].name, 'Fortnight 99');
+  const anton = streakOf(ctx, ss, 'Антон');
+  assert.strictEqual(anton.streak, 4);
+  assert.strictEqual(anton.freezesUsed, 0);
+});
+
+test('Даты текстом «ДД.ММ.ГГГГ» читаются правильно (а не как месяц.день)', () => {
+  const pad = (n) => String(n).padStart(2, '0');
+  const asText = (d) => `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
+  const { ctx, ss } = clubContext({
+    current: [{ name: 'Антон', checks: [T, T, T, T, T, T, T, T, T, T] }, { name: 'Маша', checks: [] }, { name: 'Вася', checks: [] }]
+  });
+  const sheet = ss.getSheetByName('Fortnight 98');
+  for (let i = 0; i < 14; i++) sheet.getRange(2 + i, 1).setValue(asText(sheet.getRange(2 + i, 1).getValue()));
+  assert.strictEqual(ctx.getDaysLeftInSprint(sheet), 4);
+  assert.strictEqual(streakOf(ctx, ss, 'Антон').streak, 10);
+  sheet.getRange(15, 1).setValue('какая-то ерунда');
+  assert.strictEqual(ctx.getDaysLeftInSprint(sheet), -1, 'нечитаемая дата — «не знаю», а не мусор');
+});
+
+test('Если Telegram не принял отчёт — цитата участника не пропадает', () => {
+  let failReport = true;
+  const { ctx, fetchCalls } = clubContext({}, { telegramOk: (url, payload) => !(failReport && payload && payload.parse_mode === 'Markdown') });
+  ctx.handleTelegramUpdate(groupMsg('/quote Не потеряйся', ANTON));
+  ctx.sendWeeklyReport();
+  failReport = false;
+  fetchCalls.length = 0;
+  ctx.sendWeeklyReport();
+  assert.ok(chatMessages(fetchCalls)[0].payload.text.includes('Не потеряйся'));
+});
+
 test('Заморозки показываются в рейтинге (🧊N), стрик-бейджи считаются по новому стрику', () => {
   const { ctx, fetchCalls } = clubContext({
     current: [{ name: 'Антон', checks: [T, T, T, T, T, T, T, F, T, T] }, { name: 'Маша', checks: [] }, { name: 'Вася', checks: [] }],

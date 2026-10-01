@@ -267,6 +267,7 @@ function calculateStreak(memberName, fortnightSheets) {
 function calculateStreakInfo(memberName, fortnightSheets) {
   const newestFirst = [];
   let started = false;
+  let datesApplied = false;
   let gap = 0;
 
   outer:
@@ -278,14 +279,20 @@ function calculateStreakInfo(memberName, fortnightSheets) {
     const daysCount = getSprintDaysCount(sheetInfo.sheet);
     let checkboxes = getCheckboxesForMember(sheetInfo.sheet, memberColumn, daysCount);
 
-    // Текущий спринт с читаемыми датами: только наступившие дни
-    if (s === 0 && getDaysLeftInSprint(sheetInfo.sheet) >= 0) {
-      checkboxes = checkboxes.slice(0, getElapsedDaysCount(sheetInfo.sheet, daysCount));
+    // Первый лист с читаемыми датами, где уже наступил хоть один день:
+    // берём только наступившие дни. Лист целиком в будущем (следующий
+    // спринт создали заранее) пропускаем.
+    if (!datesApplied && getDaysLeftInSprint(sheetInfo.sheet) >= 0) {
+      const elapsed = getElapsedDaysCount(sheetInfo.sheet, daysCount);
+      if (elapsed === 0) continue;
+      datesApplied = true;
+      checkboxes = checkboxes.slice(0, elapsed);
       if (checkboxes.length > 0 && checkboxes[checkboxes.length - 1] === false) {
         checkboxes.pop(); // сегодня ещё не отметился — не пропуск
       }
       started = true; // дальше каждый неотмеченный день — пропуск
     }
+    datesApplied = true; // старое правило — только для самого свежего листа
 
     for (let i = checkboxes.length - 1; i >= 0; i--) {
       if (checkboxes[i]) {
@@ -549,7 +556,10 @@ function getDaysLeftInSprint(sheet) {
   const lastDateCell = sheet.getRange(CONFIG.checkboxesStartRow + daysCount - 1, CONFIG.datesColumn).getValue();
   if (!lastDateCell) return -1;
 
-  const lastDate = new Date(lastDateCell);
+  // parseSheetDate понимает и настоящие даты, и текст '06.01.2026'
+  // (new Date('05.11.2026') в JavaScript — это 11 мая, а не 5 ноября)
+  const lastDate = parseSheetDate(lastDateCell);
+  if (!lastDate) return -1;
   const today = new Date();
 
   // Обнуляем время для корректного сравнения
@@ -1218,8 +1228,13 @@ function readDataRows(def) {
 }
 
 function appendDataRow(def, values) {
-  const sheet = getOrCreateDataSheet(def);
-  sheet.getRange(sheet.getLastRow() + 1, 1, 1, values.length).setValues([values]);
+  // Под блокировкой — чтобы две одновременные команды не записали в одну строку
+  const ok = withScriptLock(() => {
+    const sheet = getOrCreateDataSheet(def);
+    sheet.getRange(sheet.getLastRow() + 1, 1, 1, values.length).setValues([values]);
+    return true;
+  });
+  if (!ok) throw new Error('Не удалось сохранить — таблица занята');
 }
 
 function setDataCell(def, row, column, value) {
@@ -1301,8 +1316,12 @@ function pickMemberQuote() {
   const rows = readDataRows(GAME_SHEETS.QUOTES);
   const next = rows.find(r => r.values[3] !== true && String(r.values[2]).trim());
   if (!next) return null;
-  setDataCell(GAME_SHEETS.QUOTES, next.row, 4, true);
-  return { name: sanitizeUserText(next.values[1], 50), text: sanitizeUserText(next.values[2]) };
+  return { row: next.row, name: sanitizeUserText(next.values[1], 50), text: sanitizeUserText(next.values[2]) };
+}
+
+/** Пометить цитату показанной — только после того, как отчёт ушёл */
+function markQuoteShown(quote) {
+  setDataCell(GAME_SHEETS.QUOTES, quote.row, 4, true);
 }
 
 // ==================== ВОПРОСЫ К ВСТРЕЧЕ (/question) ====================
@@ -1569,13 +1588,24 @@ function countReadDaysInRange(memberName, startKey, endKey, fortnightSheets) {
 function resolveFinishedDuels(fortnightSheets, current) {
   const todayKey = dateKey(todayStart());
 
+  // Таблицу читаем ДО блокировки: пока она взята, входящие команды ждут
+  const scores = {};
+  for (const duel of getDuels()) {
+    if (duel.status !== 'active' || !(duel.end < todayKey)) continue;
+    scores[duel.id] = {
+      a: countReadDaysInRange(duel.a, duel.start, duel.end, fortnightSheets),
+      b: countReadDaysInRange(duel.b, duel.start, duel.end, fortnightSheets)
+    };
+  }
+  if (Object.keys(scores).length === 0) return [];
+
   const finishedNow = withScriptLock(() => {
     const duels = getDuels();
     const done = [];
     for (const duel of duels) {
-      if (duel.status !== 'active' || !(duel.end < todayKey)) continue;
-      duel.scoreA = countReadDaysInRange(duel.a, duel.start, duel.end, fortnightSheets);
-      duel.scoreB = countReadDaysInRange(duel.b, duel.start, duel.end, fortnightSheets);
+      if (duel.status !== 'active' || !scores[duel.id]) continue;
+      duel.scoreA = scores[duel.id].a;
+      duel.scoreB = scores[duel.id].b;
       duel.winner = duel.scoreA > duel.scoreB ? duel.a : duel.scoreB > duel.scoreA ? duel.b : null;
       duel.status = 'finished';
       duel.finishedSprint = current.name;
@@ -2268,7 +2298,15 @@ function sendWeeklyReport() {
 
   Logger.log('\n--- СООБЩЕНИЕ ---\n' + message);
 
-  sendTelegramMessage(message);
+  const sent = sendTelegramMessage(message);
+
+  if (memberQuote && sent && sent.ok) {
+    try {
+      markQuoteShown(memberQuote);
+    } catch (error) {
+      Logger.log('⚠️ Не удалось пометить цитату показанной: ' + error);
+    }
+  }
 
   // Всё ниже — дополнительные механики. Каждая в своём try/catch:
   // ошибка в одной не должна ронять остальные и тем более отчёт.
