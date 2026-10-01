@@ -77,7 +77,7 @@ const STREAK_FREEZE_EVERY_DAYS = 7;
 const STREAK_MAX_FREEZES = 2;          // больше двух копить нельзя
 // Сколько последних спринтов просматривать при подсчёте стрика —
 // ограничение, чтобы ежедневный отчёт не упирался в лимит времени Apps Script
-const STREAK_HISTORY_MAX_SHEETS = 12;
+const STREAK_HISTORY_MAX_SHEETS = 40; // ~1,5 года при спринтах по 14 дней
 
 // Камбэк: перерыв минимум 3 дня, потом минимум 3 дня чтения подряд
 const COMEBACK_MIN_GAP_DAYS = 3;
@@ -94,7 +94,9 @@ const DUEL_FORFEITS = [
 ];
 
 // Тайные напарники и анонимные послания
-const SECRET_PARTNERS_MIN_MEMBERS = 3; // меньше трёх — какая уж тут тайна
+// Минимум 4: при трёх по кругу подопечный сразу вычисляет опекуна
+// («тот, кто не я и не мой подопечный») — и анонимки перестают быть анонимными
+const SECRET_PARTNERS_MIN_MEMBERS = 4;
 const ANON_DAILY_LIMIT = 5;            // анонимных посланий на человека в день
 
 // Пользовательский текст (цитаты, вопросы, послания, книги)
@@ -753,6 +755,14 @@ function sendTelegramMessage(message, parseMode = 'Markdown', extra = {}) {
       Logger.log('✅ Сообщение отправлено!');
     } else {
       Logger.log('❌ Ошибка Telegram: ' + result.description);
+      // Например, имя с «_» в таблице ломает Markdown — тогда лучше
+      // отправить без форматирования, чем не отправить вовсе
+      if (parseMode && /parse entities/i.test(String(result.description))) {
+        Logger.log('↩️ Повторяю без форматирования');
+        delete payload.parse_mode;
+        const retry = UrlFetchApp.fetch(url, Object.assign({}, options, { payload: JSON.stringify(payload) }));
+        return JSON.parse(retry.getContentText());
+      }
     }
 
     return result;
@@ -1068,18 +1078,31 @@ function withScriptLock(fn) {
  * (иначе Telegram не примет сообщение с отчётом целиком), обрезать длину.
  */
 function sanitizeUserText(text, maxLength = USER_TEXT_MAX_LENGTH) {
-  return String(text || '')
+  const clean = String(text || '')
     .replace(/[*_`\[\]]/g, '')
     .replace(/\r/g, '')
     .replace(/\n{3,}/g, '\n\n')
-    .trim()
-    .slice(0, maxLength)
     .trim();
+  return sliceByCodePoints(clean, maxLength).trim();
+}
+
+/**
+ * Обрезать строку, не разрезая эмодзи пополам: половинка эмодзи —
+ * невалидный UTF-8, и Telegram отклоняет сообщение целиком.
+ * Длину считаем в UTF-16, как Telegram считает лимиты.
+ */
+function sliceByCodePoints(str, maxLength) {
+  let out = '';
+  for (const ch of Array.from(str)) {
+    if (out.length + ch.length > maxLength) break;
+    out += ch;
+  }
+  return out;
 }
 
 function truncateText(text, maxLength) {
   const str = String(text);
-  return str.length > maxLength ? str.slice(0, maxLength - 1) + '…' : str;
+  return str.length > maxLength ? sliceByCodePoints(str, maxLength - 1) + '…' : str;
 }
 
 /** Начало сегодняшнего дня (00:00) */
@@ -1145,10 +1168,17 @@ function parseDiscussionDate(value) {
   if (direct) return direct;
   if (typeof value !== 'string') return null;
 
-  const m = value.trim().toLowerCase().match(/^(\d{1,2})\s+([а-яё]+)(?:\s+(\d{4}))?/);
-  if (!m) return null;
-  const monthIndex = RU_MONTHS_GENITIVE.indexOf(m[2]);
-  if (monthIndex === -1) return null;
+  let monthIndex;
+  let m = value.trim().match(/^(\d{1,2})\.(\d{1,2})$/); // '02.10' — без года
+  if (m) {
+    monthIndex = Number(m[2]) - 1;
+    if (monthIndex < 0 || monthIndex > 11) return null;
+  } else {
+    m = value.trim().toLowerCase().match(/^(\d{1,2})\s+([а-яё]+)(?:\s+(\d{4}))?/);
+    if (!m) return null;
+    monthIndex = RU_MONTHS_GENITIVE.indexOf(m[2]);
+    if (monthIndex === -1) return null;
+  }
 
   const today = todayStart();
   const year = m[3] ? Number(m[3]) : today.getFullYear();
@@ -1453,6 +1483,7 @@ function resolveDuelTarget(args) {
   const raw = args.trim();
   if (raw.startsWith('@')) {
     const username = raw.slice(1).toLowerCase();
+    if (!username) return null;
     const registered = getRegisteredMembers();
     const id = Object.keys(registered).find(k => (registered[k].username || '').toLowerCase() === username);
     return id ? registered[id].name : null;
@@ -1704,7 +1735,7 @@ function handleMyTargetCommand(chatId, userId) {
   const assignment = getActiveSecretPartners();
   const pair = assignment && assignment.pairs.find(p => p.giverId === String(userId));
   if (!pair) {
-    sendPrivateText(chatId, 'Тайные напарники ещё не назначены. Они назначаются автоматически в начале спринта, когда в клубе минимум 3 человека сделали /iam. А пока можно написать всему клубу анонимно: /anon_all текст');
+    sendPrivateText(chatId, 'Тайные напарники ещё не назначены. Они назначаются автоматически в начале спринта, когда в клубе минимум 4 человека сделали /iam. А пока можно написать всему клубу анонимно: /anon_all текст');
     return;
   }
   sendPrivateText(chatId, `🎭 В спринте ${assignment.sprint} ты тайный напарник для ${pair.targetName}. Написать анонимно: /anon текст`);
@@ -1788,9 +1819,29 @@ function handleAnonCommand(chatId, userId, senderName, args, toAll) {
 
 /** '/cmd@BotName аргументы' → { command: 'cmd', args: 'аргументы' } */
 function parseCommand(text) {
-  const m = String(text).match(/^\/([a-zA-Z_]+)(?:@\S+)?(?:\s+([\s\S]*))?$/);
+  const m = String(text).match(/^\/([a-zA-Z_]+)(?:@(\S+))?(?:\s+([\s\S]*))?$/);
   if (!m) return null;
-  return { command: m[1].toLowerCase(), args: (m[2] || '').trim() };
+  // Команда адресована другому боту в группе (/help@OtherBot) — не наша
+  if (m[2] && !isOwnBotUsername(m[2])) return null;
+  return { command: m[1].toLowerCase(), args: (m[3] || '').trim() };
+}
+
+/**
+ * Совпадает ли @имя с именем нашего бота. Имя узнаём один раз через getMe
+ * и запоминаем. Если узнать не получилось — считаем командой нам
+ * (лучше ответить лишний раз, чем потерять команду).
+ */
+function isOwnBotUsername(name) {
+  const props = PropertiesService.getScriptProperties();
+  let own = props.getProperty('botUsername');
+  if (!own) {
+    const me = callTelegram('getMe', {});
+    if (me && me.ok && me.result && me.result.username) {
+      own = me.result.username;
+      props.setProperty('botUsername', own);
+    }
+  }
+  return !own || own.toLowerCase() === String(name).toLowerCase();
 }
 
 function groupHelpText() {
@@ -2070,7 +2121,9 @@ function awardGameBadges(readingData, current, fortnightSheets, booksData, commo
     if (settled.length > 0 && settled[settled.length - 1] === false) settled.pop();
 
     // 🔄 Камбэк — раз за спринт; перерыв может начаться ещё в прошлом спринте
-    if (!hasForSprint(member.name, GAME_BADGES.COMEBACK, current.name)) {
+    // (и не за тот же камбэк, что уже отметили в прошлом спринте)
+    if (!hasForSprint(member.name, GAME_BADGES.COMEBACK, current.name) &&
+        !(previous && hasForSprint(member.name, GAME_BADGES.COMEBACK, previous.name))) {
       let history = checks;
       if (previous) {
         const column = findMemberColumn(previous.sheet, member.name);
@@ -2170,7 +2223,9 @@ function sendSprintCeremony(readingData, current, fortnightSheets, commonBook) {
   // 👑 MVP — максимальный процент (при равенстве — все)
   const topPercent = Math.max(...readingData.map(m => m.percentage));
   const mvps = readingData.filter(m => m.percentage === topPercent);
-  lines.push(`👑 *MVP:* ${mvps.map(m => m.name).join(', ')} — ${topPercent}% (${mvps[0].daysRead}/${mvps[0].totalDays})`);
+  if (topPercent > 0) {
+    lines.push(`👑 *MVP:* ${mvps.map(m => m.name).join(', ')} — ${topPercent}% (${mvps[0].daysRead}/${mvps[0].totalDays})`);
+  }
 
   const achievementsSheet = getOrCreateAchievementsSheet(SpreadsheetApp.getActiveSpreadsheet());
   const existing = readExistingAchievements(achievementsSheet);
@@ -2216,8 +2271,12 @@ function sendSprintCeremony(readingData, current, fortnightSheets, commonBook) {
 
   // 🏁 Первым дочитал общую книгу
   const bookKey = 'Книга: ' + String(commonBook.title || '').trim();
-  const firstFinishers = existing.filter(r => r.badge === GAME_BADGES.FIRST_FINISH && r.sprint === bookKey).map(r => r.name);
+  // Общая книга живёт несколько спринтов — объявляем на церемонии один раз
+  const props = PropertiesService.getScriptProperties();
+  const firstFinishers = props.getProperty('firstFinishAnnounced') === bookKey ? [] :
+    existing.filter(r => r.badge === GAME_BADGES.FIRST_FINISH && r.sprint === bookKey).map(r => r.name);
   if (firstFinishers.length > 0) {
+    props.setProperty('firstFinishAnnounced', bookKey);
     lines.push(`🏁 *Первым дочитал общую книгу:* ${firstFinishers.join(', ')}`);
   }
 
@@ -2364,7 +2423,11 @@ function sendWeeklyReport() {
     }
   }
 
-  if (isLastDay) {
+  // Церемония — один раз на спринт (повторный ручной запуск отчёта или
+  // не создавшийся вовремя новый спринт не должны её дублировать)
+  const props = PropertiesService.getScriptProperties();
+  if (isLastDay && props.getProperty('ceremonyDoneFor') !== current.name) {
+    props.setProperty('ceremonyDoneFor', current.name);
     // Церемония итогов спринта — отдельным постом после отчёта
     try {
       sendSprintCeremony(readingData, current, fortnightSheets, commonBook);

@@ -67,6 +67,10 @@ function makeContext(options = {}) {
       fetch: (url, requestOptions) => {
         const payload = requestOptions && requestOptions.payload ? JSON.parse(requestOptions.payload) : null;
         fetchCalls.push({ url, payload });
+        if (options.telegramResponse) {
+          const custom = options.telegramResponse(url, payload);
+          if (custom) return { getContentText: () => JSON.stringify(custom) };
+        }
         const ok = options.telegramOk ? options.telegramOk(url, payload) : true;
         return { getContentText: () => JSON.stringify(ok ? { ok: true, result: true } : { ok: false, description: 'Forbidden: bot can\'t initiate conversation' }) };
       }
@@ -290,7 +294,8 @@ function makeClub({ current, previous, currentStartOffset = -9, commonBook = '19
     members: current || [
       { name: 'Антон', checks: [T, T, T, T, T, F, T, T, T, T] },
       { name: 'Маша', checks: [T, F, T, T, F, F, T, F, T, F] },
-      { name: 'Вася', checks: [F, F, T, F, F, F, F, F, F, F] }
+      { name: 'Вася', checks: [F, F, T, F, F, F, F, F, F, F] },
+      { name: 'Оля', checks: [] }
     ],
     commonBook,
     discussionDate
@@ -300,7 +305,8 @@ function makeClub({ current, previous, currentStartOffset = -9, commonBook = '19
     members: previous || [
       { name: 'Антон', checks: Array(14).fill(F) },
       { name: 'Маша', checks: Array(14).fill(F) },
-      { name: 'Вася', checks: Array(14).fill(F) }
+      { name: 'Вася', checks: Array(14).fill(F) },
+      { name: 'Оля', checks: Array(14).fill(F) }
     ],
     commonBook
   }));
@@ -336,8 +342,9 @@ function callback(data, from, chatId = CLUB) {
 const ANTON = { id: 111, first_name: 'Антон', username: 'anton' };
 const MASHA = { id: 222, first_name: 'Мария', username: 'masha' };
 const VASYA = { id: 333, first_name: 'Василий', username: 'vasya' };
+const OLYA = { id: 444, first_name: 'Ольга', username: 'olya' };
 
-function registerAll(ctx, users = [ANTON, MASHA, VASYA], names = ['Антон', 'Маша', 'Вася']) {
+function registerAll(ctx, users = [ANTON, MASHA, VASYA, OLYA], names = ['Антон', 'Маша', 'Вася', 'Оля']) {
   users.forEach((u, i) => ctx.handleTelegramUpdate(groupMsg('/iam ' + names[i], u)));
 }
 
@@ -657,19 +664,21 @@ test('Последний день: отчёт → бейджи → церемо�
     current: [
       { name: 'Антон', checks: Array(14).fill(T) },
       { name: 'Маша', checks: [T, T, T, T, T, T, T, F, F, F, F, F, F, F] },
-      { name: 'Вася', checks: [T, F, T, F, T, F, T, F, T, F, T, F, T, F] }
+      { name: 'Вася', checks: [T, F, T, F, T, F, T, F, T, F, T, F, T, F] },
+      { name: 'Оля', checks: [] }
     ],
     previous: [
       { name: 'Антон', checks: Array(14).fill(F) },
       { name: 'Маша', checks: Array(14).fill(T) },
-      { name: 'Вася', checks: Array(14).fill(F) }
+      { name: 'Вася', checks: Array(14).fill(F) },
+      { name: 'Оля', checks: Array(14).fill(F) }
     ]
   });
   registerAll(ctx);
   ctx.handleTelegramUpdate(groupMsg('/suggest_book Дюна', ANTON));
   ctx.handleTelegramUpdate(groupMsg('/suggest_book Мор', MASHA));
   // Напарники уже были назначены на этот спринт
-  ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася']);
+  ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася', 'Оля']);
   ctx.handleTelegramUpdate(privateMsg('/anon Держись!', ANTON));
 
   fetchCalls.length = 0;
@@ -695,7 +704,7 @@ test('Последний день: отчёт → бейджи → церемо�
   const achievements = ss.getSheetByName('Achievements').getRange(2, 1, ss.getSheetByName('Achievements').getLastRow() - 1, 3).getValues();
   assert.ok(achievements.some(r => r[0] === 'Антон' && r[1] === '🎯 Идеальный спринт'), 'старый бейдж «идеальный спринт» по-прежнему выдаётся');
   assert.ok(achievements.some(r => r[0] === 'Антон' && r[1] === '🚀 Рывок спринта'));
-  assert.ok(!ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася']), 'повторно на тот же спринт не назначаются');
+  assert.ok(!ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася', 'Оля']), 'повторно на тот же спринт не назначаются');
 });
 
 test('Последний день без кандидатов в книги: церемония зовёт /suggest_book, опроса нет', () => {
@@ -715,10 +724,10 @@ test('Тайные напарники: назначаются по кругу в
   ctx.sendWeeklyReport();
   const assignment = JSON.parse(props.get('secretPartners'));
   assert.strictEqual(assignment.sprint, 'Fortnight 98');
-  assert.strictEqual(assignment.pairs.length, 3);
+  assert.strictEqual(assignment.pairs.length, 4);
   const givers = assignment.pairs.map(p => p.giverName).sort();
   const targets = assignment.pairs.map(p => p.targetName).sort();
-  assert.deepStrictEqual(givers, ['Антон', 'Вася', 'Маша']);
+  assert.deepStrictEqual(givers, ['Антон', 'Вася', 'Маша', 'Оля']);
   assert.deepStrictEqual(targets, givers, 'каждый — чей-то подопечный ровно один раз');
   for (const p of assignment.pairs) {
     assert.notStrictEqual(p.giverName, p.targetName, 'себе не назначается');
@@ -733,9 +742,9 @@ test('Тайные напарники: назначаются по кругу в
   assert.strictEqual(messageCalls(fetchCalls).filter(c => String(c.payload.chat_id) !== CLUB).length, 0, 'на следующий день не переназначаются');
 });
 
-test('Тайные напарники: меньше 3 зарегистрированных — не назначаются', () => {
+test('Тайные напарники: меньше 4 зарегистрированных — не назначаются (при трёх опекун вычисляется)', () => {
   const { ctx, props } = clubContext();
-  registerAll(ctx, [ANTON, MASHA], ['Антон', 'Маша']);
+  registerAll(ctx, [ANTON, MASHA, VASYA], ['Антон', 'Маша', 'Вася']);
   ctx.sendWeeklyReport();
   assert.ok(!props.get('secretPartners'));
 });
@@ -783,7 +792,7 @@ test('/anon_all — анонимно всему клубу; /anon без под�
 test('Анонимки всему клубу не выдают отправителя ни в бейджах, ни на церемонии', () => {
   const { ctx, fetchCalls } = clubContext({ currentStartOffset: -13 });
   registerAll(ctx);
-  ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася']);
+  ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася', 'Оля']);
   fetchCalls.length = 0;
   for (let i = 0; i < 4; i++) ctx.handleTelegramUpdate(privateMsg('/anon_all привет ' + i, MASHA));
   ctx.sendWeeklyReport();
@@ -796,7 +805,7 @@ test('Анонимки всему клубу не выдают отправит�
 test('📮 Почтальон — только в последний день и только за послания подопечному', () => {
   const { ctx, props, fetchCalls } = clubContext({ currentStartOffset: -13 });
   registerAll(ctx);
-  ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася']);
+  ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася', 'Оля']);
   for (let i = 0; i < 3; i++) ctx.handleTelegramUpdate(privateMsg('/anon держись ' + i, MASHA));
   fetchCalls.length = 0;
   ctx.sendWeeklyReport();
@@ -1021,6 +1030,61 @@ test('Ошибка в игровых механиках не мешает отч
   assert.doesNotThrow(() => ctx.sendWeeklyReport());
   assert.ok(texts(chatMessages(fetchCalls))[0].includes('КНИЖНЫЙ КЛУБ'));
   assert.ok(ss.getSheetByName('Fortnight 99'), 'новый спринт всё равно создан');
+});
+
+test('Команды, адресованные другому боту (/help@OtherBot), игнорируются; нашему — работают', () => {
+  const { ctx, fetchCalls } = clubContext({}, {
+    telegramResponse: (url) => url.endsWith('/getMe') ? { ok: true, result: { username: 'BookClubBot' } } : null
+  });
+  ctx.handleTelegramUpdate(groupMsg('/help@OtherBot', ANTON));
+  ctx.handleTelegramUpdate(groupMsg('/anon@OtherBot привет', ANTON));
+  assert.strictEqual(chatMessages(fetchCalls).length, 0);
+  assert.ok(!fetchCalls.some(c => c.url.endsWith('/deleteMessage')));
+  ctx.handleTelegramUpdate(groupMsg('/help@bookclubbot', ANTON));
+  assert.strictEqual(chatMessages(fetchCalls).length, 1);
+  assert.strictEqual(fetchCalls.filter(c => c.url.endsWith('/getMe')).length, 1, 'имя бота запрашивается один раз');
+});
+
+test('Имя с «_» в таблице ломает Markdown — сообщение переотправляется без форматирования', () => {
+  const { ctx, fetchCalls } = clubContext({
+    current: [{ name: 'Иван_Г', checks: [T, T, T] }, { name: 'Маша', checks: [] }, { name: 'Вася', checks: [] }]
+  }, {
+    telegramResponse: (url, payload) => (payload && payload.parse_mode === 'Markdown' && /_Г/.test(payload.text))
+      ? { ok: false, description: "Bad Request: can't parse entities: Can't find end of the entity" } : null
+  });
+  ctx.sendWeeklyReport();
+  const reports = chatMessages(fetchCalls).filter(c => c.payload.text.includes('КНИЖНЫЙ КЛУБ'));
+  assert.strictEqual(reports.length, 2, 'первая попытка с Markdown, вторая — без');
+  assert.strictEqual(reports[1].payload.parse_mode, undefined);
+  assert.ok(reports[1].payload.reply_markup, 'кнопка таблицы сохраняется');
+});
+
+test('Длинный текст обрезается, не разрезая эмодзи пополам; MVP при 0% не объявляется; церемония — один раз', () => {
+  const { ctx, props, fetchCalls } = clubContext({ currentStartOffset: -13, current: [{ name: 'Антон', checks: [] }, { name: 'Маша', checks: [] }] });
+  ctx.handleTelegramUpdate(groupMsg('/quote ' + 'а'.repeat(499) + '😀😀', ANTON));
+  ctx.sendWeeklyReport();
+  const report = chatMessages(fetchCalls)[0].payload.text;
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(report), 'нет половинок эмодзи');
+  const ceremony = texts(chatMessages(fetchCalls)).find(t => t.includes('ИТОГИ СПРИНТА'));
+  assert.ok(ceremony && !ceremony.includes('MVP'));
+  assert.strictEqual(props.get('ceremonyDoneFor'), 'Fortnight 98');
+
+  // Ручной повторный запуск в тот же день — без второй церемонии
+  ctx.sendWeeklyReport();
+  assert.strictEqual(texts(chatMessages(fetchCalls)).filter(t => t.includes('ИТОГИ СПРИНТА')).length, 1);
+});
+
+test('/duel @ без имени не вызывает случайного участника без username; дата обсуждения «ДД.ММ» без года распознаётся', () => {
+  const { ctx, props, fetchCalls } = clubContext();
+  ctx.handleTelegramUpdate(groupMsg('/iam Антон', ANTON));
+  ctx.handleTelegramUpdate(groupMsg('/iam Вася', { id: 333, first_name: 'Вася' }));
+  ctx.handleTelegramUpdate(groupMsg('/duel @', ANTON));
+  assert.ok(!props.get('duels'));
+  assert.ok(texts(chatMessages(fetchCalls)).pop().includes('Не нашёл'));
+
+  const t = dayOffset(1);
+  const ddmm = `${String(t.getDate()).padStart(2, '0')}.${String(t.getMonth() + 1).padStart(2, '0')}`;
+  assert.strictEqual(ctx.dateKey(ctx.parseDiscussionDate(ddmm)), ctx.dateKey(t));
 });
 
 test('/help в чате — список команд без Markdown; /bot_version подсказывает /help', () => {
