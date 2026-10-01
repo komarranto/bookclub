@@ -30,6 +30,7 @@ const WEB_APP_URL = 'https://script.google.com/macros/s/TEST/exec';
 
 function makeContext(options = {}) {
   const props = new Map();
+  const cache = new Map();
   const fetchCalls = [];
   const logs = [];
 
@@ -51,6 +52,12 @@ function makeContext(options = {}) {
         getProperty: (k) => (props.has(k) ? props.get(k) : null),
         setProperty: (k, v) => { props.set(k, String(v)); },
         deleteProperty: (k) => { props.delete(k); }
+      })
+    },
+    CacheService: {
+      getScriptCache: () => ({
+        get: (k) => (cache.has(k) ? cache.get(k) : null),
+        put: (k, v) => { cache.set(k, String(v)); }
       })
     },
     LockService: {
@@ -708,19 +715,71 @@ test('/anon в личке: послание подопечному уходит 
   assert.strictEqual(JSON.parse(props.get('secretPartners')).pairs.find(p => p.giverName === 'Антон').sent, 1);
 });
 
-test('/anon_all и /anon без назначенных напарников — анонимно всему клубу; лимит 5 в день', () => {
-  const { ctx, fetchCalls } = clubContext();
+test('/anon_all — анонимно всему клубу; /anon без подопечного не уходит в чат молча; лимит 5', () => {
+  const { ctx, props, fetchCalls } = clubContext();
   registerAll(ctx);
   fetchCalls.length = 0;
   ctx.handleTelegramUpdate(privateMsg('/anon_all Всем привет', MASHA));
   ctx.handleTelegramUpdate(privateMsg('/anon Ещё привет', MASHA));
   const group = texts(chatMessages(fetchCalls));
-  assert.strictEqual(group.length, 2);
-  assert.ok(group.every(t => t.startsWith('📨 Анонимное послание клубу') && !t.includes('Маша')));
+  assert.strictEqual(group.length, 1, '/anon без назначенных напарников в чат не уходит');
+  assert.ok(group[0].startsWith('📨 Анонимное послание клубу') && !group[0].includes('Маша'));
+  assert.ok(texts(dmMessages(fetchCalls, 222)).some(t => t.includes('/anon_all')), 'подсказка про /anon_all');
 
   for (let i = 0; i < 5; i++) ctx.handleTelegramUpdate(privateMsg('/anon_all спам ' + i, MASHA));
-  assert.strictEqual(chatMessages(fetchCalls).length, 5, 'не больше 5 анонимок в день');
-  assert.ok(texts(dmMessages(fetchCalls, 222)).some(t => t.includes('лимит')));
+  assert.strictEqual(chatMessages(fetchCalls).length, 5, 'не больше 5 анонимок');
+  assert.ok(texts(dmMessages(fetchCalls, 222)).some(t => t.includes('Лимит')));
+
+  // В Script Properties (их видит любой редактор таблицы) — ни следа от отправителя
+  for (const [key, value] of props) {
+    assert.ok(!value.includes('222') || key === 'telegramMembers', `ключ ${key} не должен хранить id отправителя анонимки`);
+  }
+});
+
+test('Анонимки всему клубу не выдают отправителя ни в бейджах, ни на церемонии', () => {
+  const { ctx, fetchCalls } = clubContext({ currentStartOffset: -13 });
+  registerAll(ctx);
+  ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася']);
+  fetchCalls.length = 0;
+  for (let i = 0; i < 4; i++) ctx.handleTelegramUpdate(privateMsg('/anon_all привет ' + i, MASHA));
+  ctx.sendWeeklyReport();
+  const later = texts(chatMessages(fetchCalls)).filter(t => !t.startsWith('📨'));
+  assert.ok(!later.some(t => t.includes('Почтальон')), 'анонимки всему клубу не дают бейдж');
+  const ceremony = later.find(t => t.includes('ИТОГИ СПРИНТА'));
+  assert.ok(!/послани/.test(ceremony), 'нулевые счётчики посланий не показываются');
+});
+
+test('📮 Почтальон — только в последний день и только за послания подопечному', () => {
+  const { ctx, props, fetchCalls } = clubContext({ currentStartOffset: -13 });
+  registerAll(ctx);
+  ctx.ensureSecretPartners('Fortnight 98', ['Антон', 'Маша', 'Вася']);
+  for (let i = 0; i < 3; i++) ctx.handleTelegramUpdate(privateMsg('/anon держись ' + i, MASHA));
+  fetchCalls.length = 0;
+  ctx.sendWeeklyReport();
+  const all = texts(chatMessages(fetchCalls));
+  assert.ok(all.some(t => t.includes('*Маша* получает «📮 Почтальон»')));
+  const target = JSON.parse(props.get('secretPartners')).pairs.find(p => p.giverName === 'Маша').targetName;
+  assert.ok(all.find(t => t.includes('ИТОГИ СПРИНТА')).includes(`Маша → ${target} (3 послания)`));
+
+  const mid = clubContext();
+  registerAll(mid.ctx);
+  mid.ctx.sendWeeklyReport(); // назначение напарников посреди спринта
+  for (let i = 0; i < 3; i++) mid.ctx.handleTelegramUpdate(privateMsg('/anon держись ' + i, MASHA));
+  mid.fetchCalls.length = 0;
+  mid.ctx.sendWeeklyReport();
+  assert.ok(!texts(chatMessages(mid.fetchCalls)).some(t => t.includes('Почтальон')), 'посреди спринта бейдж выдал бы напарника');
+});
+
+test('Фото в личку — подсказка, что пока только текст; незарегистрированный жмёт «Принять» — подсказка про /iam', () => {
+  const { ctx, props, fetchCalls } = clubContext();
+  ctx.handleTelegramUpdate({ postData: { contents: JSON.stringify({ update_id: nextUpdateId++, message: { chat: { id: 222, type: 'private' }, from: MASHA, photo: [{}] } }) }, parameter: { secret: 'test-secret' } });
+  assert.ok(dmMessages(fetchCalls, 222)[0].payload.text.includes('только текст'));
+
+  registerAll(ctx, [ANTON], ['Антон']);
+  ctx.handleTelegramUpdate(groupMsg('/duel Маша', ANTON));
+  const duel = JSON.parse(props.get('duels'))[0];
+  ctx.handleTelegramUpdate(callback('duel_accept:' + duel.id, MASHA));
+  assert.ok(fetchCalls.filter(c => c.url.endsWith('/answerCallbackQuery')).pop().payload.text.includes('/iam'));
 });
 
 test('Личка: незарегистрированному — подсказка, ничего не уходит в чат; /start — справка; /meeting_done из лички не работает', () => {
@@ -774,6 +833,7 @@ test('Дуэль: вызов с кнопкой, принять может тол
 
   ctx.handleTelegramUpdate(groupMsg('/duel Маша', VASYA));
   ctx.handleTelegramUpdate(groupMsg('/duel @masha', ANTON));
+  assert.ok(texts(chatMessages(fetchCalls)).some(t => t.includes('Антон вызывает Маша (@masha) на дуэль')), 'соперник упомянут через @username');
   // Вася вызвал первым, Антон тоже может вызвать — пока никто не принял
   const challenge = chatMessages(fetchCalls).filter(c => c.payload.reply_markup && c.payload.reply_markup.inline_keyboard[0][0].callback_data);
   assert.strictEqual(challenge.length, 2);

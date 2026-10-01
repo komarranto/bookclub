@@ -1484,8 +1484,14 @@ function handleDuelCommand(from, args) {
   }
   if (!duel) return;
 
+  // @username соперника (если он делал /iam) — чтобы Telegram прислал ему уведомление
+  const registered = getRegisteredMembers();
+  const targetId = Object.keys(registered).find(id => registered[id].name === target);
+  const targetUsername = targetId && registered[targetId].username;
+  const targetMention = targetUsername ? `${target} (@${targetUsername})` : target;
+
   sendTelegramMessage(
-    `⚔️ ${challenger} вызывает ${target} на дуэль!\n\n` +
+    `⚔️ ${challenger} вызывает ${targetMention} на дуэль!\n\n` +
     `${DUEL_LENGTH_DAYS} дней: кто больше дней почитает. Проигравший выполняет фант.\n` +
     `${target}, вызов действует сутки.`,
     null,
@@ -1509,7 +1515,8 @@ function acceptDuel(duelId, from) {
     const duel = duels.find(d => d.id === duelId);
     if (!duel || duel.status === 'expired') return { answer: 'Вызов не найден или устарел' };
     if (duel.status !== 'pending') return { answer: 'Эта дуэль уже идёт или завершена' };
-    if (!name || name !== duel.b) return { answer: `Этот вызов адресован ${duel.b} 🙂` };
+    if (!name) return { answer: 'Сначала напиши в чате клуба /iam Имя (как в таблице), потом нажми кнопку ещё раз' };
+    if (name !== duel.b) return { answer: `Этот вызов адресован ${duel.b} 🙂` };
     if (Date.now() - duel.createdAt > DUEL_ACCEPT_TIMEOUT_MS) {
       duel.status = 'expired';
       writeJsonProperty('duels', pruneDuels(duels));
@@ -1674,8 +1681,14 @@ function handleMyTargetCommand(chatId, userId) {
 }
 
 /**
- * Анонимное послание. toAll = false — подопечному (если назначен),
- * иначе — всему клубу. Лимит ANON_DAILY_LIMIT посланий в день на человека.
+ * Анонимное послание. toAll = false — подопечному (только если тайные
+ * напарники назначены), toAll = true — всему клубу.
+ *
+ * Анонимность: кто что отправил, бот нигде не хранит по имени. Лимит
+ * ANON_DAILY_LIMIT считается в CacheService (временное хранилище, его не
+ * видно в настройках проекта, где Script Properties может открыть любой
+ * редактор таблицы). Счётчик посланий подопечному хранится в паре —
+ * она и так раскрывается на церемонии.
  */
 function handleAnonCommand(chatId, userId, senderName, args, toAll) {
   const text = sanitizeUserText(args);
@@ -1687,48 +1700,43 @@ function handleAnonCommand(chatId, userId, senderName, args, toAll) {
   }
 
   const sprintName = getCurrentSheet().name;
-  const today = dateKey(todayStart());
+  const limitKey = `anon:${userId}:${dateKey(todayStart())}`;
 
   const prepared = withScriptLock(() => {
-    const daily = readJsonProperty('anonDailyCounts', { date: today, counts: {} });
-    if (daily.date !== today) {
-      daily.date = today;
-      daily.counts = {};
-    }
-    const used = daily.counts[String(userId)] || 0;
-    if (used >= ANON_DAILY_LIMIT) return { limit: true };
-    daily.counts[String(userId)] = used + 1;
-    writeJsonProperty('anonDailyCounts', daily);
-
-    const stats = readJsonProperty('anonStats', { sprint: sprintName, counts: {} });
-    if (stats.sprint !== sprintName) {
-      stats.sprint = sprintName;
-      stats.counts = {};
-    }
-    stats.counts[senderName] = (stats.counts[senderName] || 0) + 1;
-    writeJsonProperty('anonStats', stats);
-
-    let targetName = null;
+    let pair = null;
+    let assignment = null;
     if (!toAll) {
-      const assignment = getSecretPartners();
+      assignment = getSecretPartners();
       if (assignment && assignment.sprint === sprintName) {
-        const pair = assignment.pairs.find(p => p.giverId === String(userId));
-        if (pair) {
-          pair.sent = (pair.sent || 0) + 1;
-          targetName = pair.targetName;
-          writeJsonProperty('secretPartners', assignment);
-        }
+        pair = assignment.pairs.find(p => p.giverId === String(userId)) || null;
       }
+      // /anon без подопечного не превращаем молча в послание всему клубу
+      if (!pair) return { noPartner: true };
     }
-    return { targetName: targetName };
+
+    const cache = CacheService.getScriptCache();
+    const used = Number(cache.get(limitKey) || 0);
+    if (used >= ANON_DAILY_LIMIT) return { limit: true };
+    cache.put(limitKey, String(used + 1), 6 * 60 * 60); // максимум CacheService — 6 часов
+
+    if (pair) {
+      pair.sent = (pair.sent || 0) + 1;
+      writeJsonProperty('secretPartners', assignment);
+      return { targetName: pair.targetName };
+    }
+    return { targetName: null };
   });
 
   if (!prepared) {
     sendPrivateText(chatId, 'Не получилось отправить, попробуй ещё раз через минуту.');
     return;
   }
+  if (prepared.noPartner) {
+    sendPrivateText(chatId, 'У тебя пока нет подопечного: тайные напарники назначаются в начале спринта. Написать анонимно всему клубу: /anon_all текст');
+    return;
+  }
   if (prepared.limit) {
-    sendPrivateText(chatId, `На сегодня лимит анонимок исчерпан (${ANON_DAILY_LIMIT} в день). Завтра — снова можно!`);
+    sendPrivateText(chatId, `Лимит анонимок исчерпан (${ANON_DAILY_LIMIT} за несколько часов). Попробуй попозже!`);
     return;
   }
 
@@ -1938,8 +1946,11 @@ const SECRET_BADGES = [
     check: (c) => (c.stats.questions[c.member.name] || 0) >= 3
   },
   {
-    title: '📮 Почтальон', // 3+ анонимки за спринт
-    check: (c) => (c.stats.anon[c.member.name] || 0) >= 3
+    // 3+ послания подопечному за спринт. Выдаётся только в последний день,
+    // вместе с раскрытием пар, — раньше бейдж выдал бы тайного напарника.
+    // Послания всему клубу (/anon_all) не считаются: они анонимны навсегда.
+    title: '📮 Почтальон',
+    check: (c) => c.isLastDay && (c.stats.partnerSent[c.member.name] || 0) >= 3
   },
   {
     title: '🗡 Гладиатор', // 3 выигранные дуэли
@@ -1957,11 +1968,15 @@ function countByAuthor(rows, authorIndex) {
 }
 
 function collectMemberActivityStats(sprintName) {
-  const anonStats = readJsonProperty('anonStats', null);
+  const partners = getSecretPartners();
+  const partnerSent = {};
+  if (partners && partners.sprint === sprintName) {
+    for (const p of partners.pairs) partnerSent[p.giverName] = p.sent || 0;
+  }
   return {
     quotes: countByAuthor(readDataRows(GAME_SHEETS.QUOTES), 1),
     questions: countByAuthor(readDataRows(GAME_SHEETS.QUESTIONS), 1),
-    anon: anonStats && anonStats.sprint === sprintName ? anonStats.counts : {},
+    partnerSent: partnerSent,
     duelWins: readJsonProperty('duelWins', {})
   };
 }
@@ -2195,7 +2210,8 @@ function sendSprintCeremony(readingData, current, fortnightSheets, commonBook) {
     lines.push('🎭 *Тайные напарники раскрыты:*');
     for (const p of partners.pairs) {
       const sent = p.sent || 0;
-      lines.push(`   ${p.giverName} → ${p.targetName} (${sent} ${pluralRu(sent, 'послание', 'послания', 'посланий')})`);
+      const sentText = sent > 0 ? ` (${sent} ${pluralRu(sent, 'послание', 'послания', 'посланий')})` : '';
+      lines.push(`   ${p.giverName} → ${p.targetName}${sentText}`);
     }
   }
 
@@ -2501,7 +2517,14 @@ function handleTelegramUpdate(e) {
 
     const message = update.message;
 
-    if (!message || !message.text) {
+    if (!message) {
+      return 'ok';
+    }
+    if (!message.text) {
+      // Фото/стикер/голосовое в личку — анонимки пока только текстом
+      if (message.chat && message.chat.type === 'private') {
+        sendPrivateText(message.chat.id, 'Пока я понимаю только текст. Анонимное послание: /anon текст или /anon_all текст');
+      }
       return 'ok';
     }
 
