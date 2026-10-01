@@ -1087,6 +1087,35 @@ test('/duel @ без имени не вызывает случайного уч�
   assert.strictEqual(ctx.dateKey(ctx.parseDiscussionDate(ddmm)), ctx.dateKey(t));
 });
 
+test('launchGameMechanics: обновляет меню команд, проверяет админа и шлёт анонс один раз', () => {
+  const { ctx, props, fetchCalls, logs } = clubContext({}, {
+    telegramResponse: (url) => {
+      if (url.endsWith('/getMe')) return { ok: true, result: { id: 42, username: 'BookClubBot' } };
+      if (url.endsWith('/getChatMember')) return { ok: true, result: { status: 'member' } };
+      return null;
+    }
+  });
+  assert.strictEqual(ctx.launchGameMechanics(), true);
+  assert.strictEqual(fetchCalls.filter(c => c.url.endsWith('/setMyCommands')).length, 2);
+  assert.ok(logs.some(l => l.includes('НЕ администратор')), 'предупреждение, если бот не админ');
+  const announce = chatMessages(fetchCalls).pop().payload;
+  assert.strictEqual(announce.parse_mode, undefined, 'без Markdown — в командах подчёркивания');
+  assert.ok(announce.text.includes('@BookClubBot') && announce.text.includes('/anon_all') && announce.text.includes('/iam'));
+  assert.strictEqual(announce.reply_markup.inline_keyboard[0][0].url, 'https://t.me/BookClubBot?start=hello');
+  assert.ok(announce.text.length < 4096);
+
+  fetchCalls.length = 0;
+  assert.strictEqual(ctx.launchGameMechanics(), false, 'повторно анонс не шлётся');
+  assert.strictEqual(chatMessages(fetchCalls).length, 0);
+  assert.strictEqual(fetchCalls.filter(c => c.url.endsWith('/setMyCommands')).length, 2, 'но меню команд обновляется');
+  assert.strictEqual(ctx.launchGameMechanics(true), true);
+
+  // /start из кнопки «Открыть бота» (/start hello) — справка в личке
+  fetchCalls.length = 0;
+  ctx.handleTelegramUpdate(privateMsg('/start hello', ANTON));
+  assert.ok(dmMessages(fetchCalls, 111)[0].payload.text.includes('/anon'));
+});
+
 test('/help в чате — список команд без Markdown; /bot_version подсказывает /help', () => {
   const { ctx, fetchCalls } = clubContext();
   ctx.handleTelegramUpdate(groupMsg('/help', ANTON));

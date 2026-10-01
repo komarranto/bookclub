@@ -2771,6 +2771,84 @@ function setupTelegramWebhook(webAppUrl) {
   Logger.log('setMyCommands (личка): ' + privateCommandsResponse.getContentText());
 }
 
+// ==================== ЗАПУСК ИГРОВЫХ МЕХАНИК ====================
+
+/**
+ * 🚀 ЗАПУСТИТЬ ИГРОВЫЕ МЕХАНИКИ — один раз после обновления кода
+ * (и после Deploy → Manage deployments → New version).
+ *
+ * 1. Перерегистрирует вебхук и меню команд Telegram (setupTelegramWebhook).
+ * 2. Проверяет, что бот — администратор группы (нужно, чтобы удалять
+ *    /anon, случайно отправленный в общий чат).
+ * 3. Отправляет в чат анонс: что добавилось и как писать анонимно,
+ *    с кнопкой «открыть бота в личке».
+ *
+ * Анонс уходит один раз; повторный запуск только обновит меню команд.
+ * Отправить анонс ещё раз: launchGameMechanics(true).
+ */
+function launchGameMechanics(forceAnnouncement) {
+  setupTelegramWebhook();
+
+  const me = callTelegram('getMe', {});
+  const botUsername = me && me.ok && me.result ? me.result.username : '';
+  if (botUsername) {
+    PropertiesService.getScriptProperties().setProperty('botUsername', botUsername);
+  }
+
+  if (me && me.ok && me.result) {
+    const member = callTelegram('getChatMember', { chat_id: TELEGRAM_CHAT_ID, user_id: me.result.id });
+    const status = member && member.ok && member.result ? member.result.status : 'неизвестно';
+    if (status === 'administrator' || status === 'creator') {
+      Logger.log('✅ Бот — администратор группы');
+    } else {
+      Logger.log(`⚠️ Бот НЕ администратор группы (статус: ${status}). Сделайте его админом с правом удалять сообщения.`);
+    }
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('gameAnnouncementSent') && forceAnnouncement !== true) {
+    Logger.log('ℹ️ Анонс уже отправлялся — меню команд обновлено, анонс не повторяю. Повторить: launchGameMechanics(true)');
+    return false;
+  }
+
+  const result = sendTelegramMessage(formatGameAnnouncement(botUsername), null, {
+    replyMarkup: botUsername
+      ? { inline_keyboard: [[{ text: '🤫 Открыть бота в личке', url: `https://t.me/${botUsername}?start=hello` }]] }
+      : undefined,
+    noButton: true
+  });
+
+  if (result && result.ok) {
+    props.setProperty('gameAnnouncementSent', new Date().toISOString());
+    Logger.log('✅ Анонс отправлен в чат клуба');
+    return true;
+  }
+  Logger.log('❌ Анонс не отправлен — см. ошибку выше');
+  return false;
+}
+
+/** Текст анонса игровых механик (без Markdown: в командах подчёркивания) */
+function formatGameAnnouncement(botUsername) {
+  const bot = botUsername ? '@' + botUsername : 'бота клуба';
+  return '📚 Бот клуба прокачался!\n\n' +
+    'Сначала один раз:\n' +
+    '1️⃣ Напишите здесь /iam Имя — как в таблице\n' +
+    `2️⃣ Откройте ${bot} в личке и нажмите Start (кнопка ниже)\n\n` +
+    '🤫 Анонимно в чат — пишите боту В ЛИЧКУ:\n' +
+    '• /anon_all текст — послание всему клубу, без имени\n' +
+    '• /anon текст — послание вашему тайному подопечному\n' +
+    'В начале спринта каждому достанется тайный подопечный — кого вы опекаете, бот напишет в личку. ' +
+    'Подбадривайте его анонимно, а в конце спринта всех раскроем 🎭\n\n' +
+    'Ещё:\n' +
+    '⚔️ /duel Имя — дуэль на 7 дней: кто больше почитает, проигравший выполняет фант\n' +
+    '💬 /quote текст — ваша цитата в отчёте\n' +
+    '❓ /question текст — вопрос к встрече\n' +
+    '📖 /suggest_book название — предложить следующую книгу, проголосуем в конце спринта\n' +
+    '🧊 7 дней чтения подряд дают заморозку стрика\n' +
+    '🔮 За что дают секретные бейджи — догадайтесь сами 😏\n\n' +
+    'Все команды: /help';
+}
+
 // ==================== СОЗДАНИЕ СПРИНТОВ ====================
 
 /**
@@ -2786,6 +2864,8 @@ function onOpen() {
     .addSeparator()
     .addItem('⚙️ Настроить ежедневный триггер', 'setupDailyTrigger')
     .addItem('🗑️ Удалить все триггеры', 'removeAllTriggers')
+    .addSeparator()
+    .addItem('🚀 Запустить игровые механики (меню команд + анонс)', 'launchGameMechanics')
     .addToUi();
 }
 
