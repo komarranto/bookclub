@@ -1109,6 +1109,7 @@ test('launchGameMechanics: обновляет меню команд, прове�
   assert.strictEqual(chatMessages(fetchCalls).length, 0);
   assert.strictEqual(fetchCalls.filter(c => c.url.endsWith('/setMyCommands')).length, 2, 'но меню команд обновляется');
   assert.strictEqual(ctx.launchGameMechanics(true), true);
+  assert.strictEqual(ctx.resendGameAnnouncement(), true, 'кнопка «ещё раз» отправляет анонс повторно');
 
   // /start из кнопки «Открыть бота» (/start hello) — справка в личке
   fetchCalls.length = 0;

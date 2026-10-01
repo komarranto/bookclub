@@ -2827,6 +2827,15 @@ function launchGameMechanics(forceAnnouncement) {
   return false;
 }
 
+/**
+ * 📣 Отправить анонс ещё раз (например, если его удалили или в чат
+ * пришли новые люди). Отдельная функция — чтобы запускать из списка
+ * функций в редакторе без аргументов.
+ */
+function resendGameAnnouncement() {
+  return launchGameMechanics(true);
+}
+
 /** Текст анонса игровых механик (без Markdown: в командах подчёркивания) */
 function formatGameAnnouncement(botUsername) {
   const bot = botUsername ? '@' + botUsername : 'бота клуба';
@@ -2866,6 +2875,7 @@ function onOpen() {
     .addItem('🗑️ Удалить все триггеры', 'removeAllTriggers')
     .addSeparator()
     .addItem('🚀 Запустить игровые механики (меню команд + анонс)', 'launchGameMechanics')
+    .addItem('📣 Отправить анонс ещё раз', 'resendGameAnnouncement')
     .addToUi();
 }
 
