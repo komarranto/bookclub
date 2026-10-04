@@ -119,42 +119,4 @@ class FakeSpreadsheet {
   moveActiveSheet() {}
 }
 
-const DAY = 24 * 60 * 60 * 1000;
-
-function dayOffset(offset) {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() + offset);
-  return d;
-}
-
-/**
- * Лист спринта в формате, который ждёт бот:
- * A — даты (настоящие Date), B… — участники с чекбоксами,
- * J…L — секция книг ("Основная книга", "Общая книга", "Дата обсуждения",
- * дальше участник / книга / чекбокс "дочитал").
- *
- * startOffset — смещение первого дня спринта от сегодня (в днях).
- * members: [{ name, checks: [bool…], book, finished }]
- */
-function makeSprintSheet(name, { startOffset, days = 14, members, commonBook = '1984', discussionDate = '25 января' }) {
-  const sheet = new FakeSheet(name);
-  members.forEach((m, j) => sheet.set(1, 2 + j, m.name));
-  for (let i = 0; i < days; i++) {
-    sheet.set(2 + i, 1, dayOffset(startOffset + i));
-    members.forEach((m, j) => sheet.set(2 + i, 2 + j, Boolean(m.checks && m.checks[i])));
-  }
-  sheet.set(1, 10, 'Основная книга спринта:');
-  sheet.set(2, 10, 'Общая книга');
-  sheet.set(2, 11, commonBook);
-  sheet.set(3, 10, 'Дата обсуждения');
-  sheet.set(3, 11, discussionDate);
-  members.forEach((m, j) => {
-    sheet.set(4 + j, 10, m.name);
-    sheet.set(4 + j, 11, m.book || 'Книга ' + m.name);
-    sheet.set(4 + j, 12, Boolean(m.finished));
-  });
-  return sheet;
-}
-
-module.exports = { FakeSheet, FakeSpreadsheet, makeSprintSheet, dayOffset, DAY };
+module.exports = { FakeSheet, FakeSpreadsheet };
