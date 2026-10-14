@@ -80,6 +80,9 @@ const BOOK_TITLE_MAX_LENGTH = 100; // = лимит длины варианта �
 // Всего заявок за цикл: состояние цикла хранится в Script Properties
 // (лимит 9 КБ на значение), 30 названий по 100 символов туда помещаются
 const MAX_SUBMISSIONS_PER_CYCLE = 30;
+// Лимит Script Properties — в байтах UTF-8 (кириллица — 2 байта на букву).
+// Названия и авторы всех заявок вместе — не больше стольких байт.
+const CANDIDATES_MAX_BYTES = 5000;
 const DATE_MOVES_PER_CYCLE = 2;   // сколько раз за цикл можно сдвинуть выбор даты (/another_time)
 const POLL_STOP_RETRIES = 6;      // сколько раз (по часу) пробовать закрыть опрос при сбое Telegram
 
@@ -181,7 +184,49 @@ function sendPoll(question, options, extra = {}) {
     is_anonymous: extra.anonymous === true,
     allows_multiple_answers: extra.multiple === true
   });
-  return result && result.ok && result.result && result.result.message_id ? result.result.message_id : null;
+  const messageId = result && result.ok && result.result && result.result.message_id ? result.result.message_id : null;
+  const pollId = messageId && result.result.poll ? result.result.poll.id : null;
+  if (pollId) rememberPoll(pollId, messageId);
+  return messageId;
+}
+
+// ---------- Голоса по ходу опроса ----------
+//
+// Telegram присылает вебхук 'poll' на каждый голос в опросах бота — бот
+// запоминает последние итоги. Если ответ на stopPoll потеряется (опрос уже
+// закрыт, а повторно прочитать итоги Bot API не даёт), голоса берутся отсюда,
+// а не считаются нулями. Хранится отдельно от цикла (свой лимит 9 КБ).
+
+function rememberPoll(pollId, messageId) {
+  withScriptLock(() => {
+    const index = readJsonProperty('pollIndex', {});
+    index[pollId] = messageId;
+    const keys = Object.keys(index);
+    if (keys.length > 40) keys.slice(0, keys.length - 40).forEach(k => delete index[k]);
+    writeJsonProperty('pollIndex', index);
+  });
+}
+
+function handlePollUpdate(poll) {
+  if (!poll || !poll.id || !Array.isArray(poll.options)) return 'ok';
+  withScriptLock(() => {
+    const index = readJsonProperty('pollIndex', {});
+    const messageId = index[poll.id];
+    if (!messageId) return;
+    const counts = readJsonProperty('pollCounts', {});
+    delete counts[messageId]; // переставляем в конец — свежие не вытесняются
+    counts[messageId] = poll.options.map(o => Number(o.voter_count) || 0);
+    const keys = Object.keys(counts);
+    if (keys.length > 40) keys.slice(0, keys.length - 40).forEach(k => delete counts[k]);
+    writeJsonProperty('pollCounts', counts);
+  });
+  return 'ok';
+}
+
+function lastKnownCounts(messageId, optionsCount) {
+  const counts = readJsonProperty('pollCounts', {})[messageId];
+  if (!Array.isArray(counts)) return null;
+  return new Array(optionsCount).fill(0).map((z, i) => Number(counts[i]) || 0);
 }
 
 /**
@@ -195,7 +240,14 @@ function stopPollCounts(messageId, optionsCount) {
   if (!messageId) return zeros;
   const result = callTelegram('stopPoll', { chat_id: TELEGRAM_CHAT_ID, message_id: messageId });
   if (!result || !result.ok) {
-    const permanent = /not found|already been closed|can't be stopped|message to stop/i.test(String(result && result.description));
+    const description = String(result && result.description);
+    if (/already been closed/i.test(description)) {
+      // Опрос закрылся, но ответ с итогами потерялся — берём последние известные голоса
+      const known = lastKnownCounts(messageId, optionsCount);
+      if (!known) Logger.log(`⚠️ Опрос ${messageId} уже закрыт, итогов нет — считаю без его голосов`);
+      return known || zeros;
+    }
+    const permanent = /not found|can't be stopped|message to stop/i.test(description);
     return permanent ? zeros : null;
   }
   const poll = result.result;
@@ -365,6 +417,15 @@ function formatTimeLeft(iso) {
 }
 
 /** Сравнение названий: без регистра, лишних пробелов и кавычек */
+function utf8Length(str) {
+  let bytes = 0;
+  for (const ch of Array.from(String(str))) {
+    const code = ch.codePointAt(0);
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+
 function normalizeTitle(title) {
   return String(title).toLowerCase().replace(/[«»"'“”„]/g, '').replace(/\s+/g, ' ').trim();
 }
@@ -475,8 +536,12 @@ function getOrCreateDataSheet(def) {
   let sheet = ss.getSheetByName(def.name);
   if (!sheet) {
     sheet = ss.insertSheet(def.name);
-    sheet.getRange(1, 1, 1, def.headers.length).setValues([def.headers]);
     if (def.hidden) sheet.hideSheet();
+  }
+  // Заголовки — и при создании, и если в прошлый раз запись заголовков
+  // сорвалась (иначе первая строка данных встала бы на место заголовка)
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, def.headers.length).setValues([def.headers]);
   }
   return sheet;
 }
@@ -596,7 +661,7 @@ function formatPinnedText(cycle, intro) {
   let text = intro ? intro + '\n\n' : '';
   text += `📌 Цикл #${cycle.id}` + (cycle.book ? ` — ${displayBook(cycle.book.title)}` : '') + '\n';
   if (cycle.cancelled) {
-    return text + '❌ Цикл отменён. Начать новый: /start_cycle';
+    return text + 'Сейчас: ❌ Цикл отменён\n\n👉 Начать новый выбор книги может любой участник: /start_cycle';
   }
   text += `Сейчас: ${PHASE_TITLES[cycle.phase]}\n\n${formatTimeline(cycle)}`;
   if (cycle.moderator && cycle.phase !== 'done') text += `\n\n🎙 Ведущий встречи: ${cycle.moderator}`;
@@ -609,6 +674,7 @@ function pinCycleSchedule(cycle, intro) {
   const messageId = messageIdOf(sendChatText(formatPinnedText(cycle, intro)));
   if (!messageId) return;
   cycle.pinnedMessageId = messageId;
+  cycle.pinnedSignature = cycleSignature(cycle);
   // Закрепляем с уведомлением — чтобы все увидели старт цикла
   callTelegram('pinChatMessage', { chat_id: TELEGRAM_CHAT_ID, message_id: messageId, disable_notification: false });
 }
@@ -621,7 +687,11 @@ function cycleSignature(cycle) {
 
 function refreshPinnedSchedule(cycle) {
   if (!cycle || !cycle.pinnedMessageId) return;
-  callTelegram('editMessageText', { chat_id: TELEGRAM_CHAT_ID, message_id: cycle.pinnedMessageId, text: formatPinnedText(cycle) });
+  const result = callTelegram('editMessageText', { chat_id: TELEGRAM_CHAT_ID, message_id: cycle.pinnedMessageId, text: formatPinnedText(cycle) });
+  // Не получилось — подпись не обновляем, следующий tick попробует снова
+  if ((result && result.ok) || /not modified/i.test(String(result && result.description))) {
+    cycle.pinnedSignature = cycleSignature(cycle);
+  }
   if (cycle.phase === 'done') {
     callTelegram('unpinChatMessage', { chat_id: TELEGRAM_CHAT_ID, message_id: cycle.pinnedMessageId });
   }
@@ -716,6 +786,7 @@ function handleStartCycleCommand() {
     const fresh = getCycle();
     if (fresh && fresh.id === c.id) {
       fresh.pinnedMessageId = c.pinnedMessageId;
+      fresh.pinnedSignature = c.pinnedSignature;
       saveCycle(fresh);
     }
   });
@@ -747,6 +818,8 @@ function handleSuggestBookCommand(from, args, reply, ask) {
     const mine = books.filter(b => b.authorId === String(from.id));
     if (mine.length >= BOOKS_PER_MEMBER) return { limit: mine };
     if (books.length >= MAX_SUBMISSIONS_PER_CYCLE) return { full: true };
+    const usedBytes = books.reduce((sum, b) => sum + utf8Length(b.title) + utf8Length(b.author), 0);
+    if (usedBytes + utf8Length(title) + utf8Length(getAuthorName(from)) > CANDIDATES_MAX_BYTES) return { full: true };
     appendDataRow(DATA_SHEETS.CYCLE_BOOKS, [cycle.id, new Date(), getAuthorName(from), String(from.id), title]);
     return { count: books.length + 1, mine: mine.length + 1 };
   });
@@ -755,7 +828,7 @@ function handleSuggestBookCommand(from, args, reply, ask) {
     return;
   }
   if (result.full) {
-    reply(`В цикле уже ${MAX_SUBMISSIONS_PER_CYCLE} заявок — это максимум. Голосование начнётся ${formatDeadline(cycle.submitUntil)}.`);
+    reply(`Список заявок заполнен — больше в один опрос не поместится. Голосование начнётся ${formatDeadline(cycle.submitUntil)}.`);
   } else if (result.closed) {
     reply('Приём заявок только что закрылся. Свою книгу предложи в следующем цикле. Что сейчас: /status');
   } else if (result.duplicate) {
@@ -1133,15 +1206,20 @@ function tick() {
   withScriptLock(() => {
     const cycle = getCycle();
     if (!isCycleActive(cycle)) return;
-    const before = cycleSignature(cycle);
     try {
       advanceCycle(cycle, false);
     } finally {
+      // Закреп отстаёт от состояния (этап сменился или прошлое обновление
+      // не удалось) — обновляем
+      try {
+        if (cycle.pinnedMessageId && cycleSignature(cycle) !== cycle.pinnedSignature) refreshPinnedSchedule(cycle);
+      } catch (error) {
+        Logger.log('⚠️ Не удалось обновить закреп: ' + error);
+      }
       // Сохраняем даже при ошибке: отправленные опросы и флаги напоминаний
       // не должны потеряться, иначе через час всё уйдёт в чат повторно
       saveCycle(cycle);
     }
-    if (cycleSignature(cycle) !== before) refreshPinnedSchedule(cycle);
   });
 }
 
@@ -1187,7 +1265,8 @@ function resendMissingPolls(cycle) {
     if (new Date(cycle[key]).getTime() < minimum.getTime()) cycle[key] = minimum.toISOString();
     sendChatText(missing
       ? '↩️ Часть опросов удалось отправить (выше), остальные бот попробует отправить через час.'
-      : `↩️ ${pending.length > 1 ? 'Опросы не отправились вовремя — отправил их сейчас' : 'Опрос не отправился вовремя — отправил его сейчас'} (выше). Голосуем до ${formatDeadline(cycle[key])}.`);
+      : `↩️ ${pending.length > 1 ? 'Опросы не отправились вовремя — отправил их сейчас' : 'Опрос не отправился вовремя — отправил его сейчас'} (выше). Голосуем до ${formatDeadline(cycle[key])}. ` +
+        'Если видишь два одинаковых опроса — голосуй в последнем.');
     cycle.sent = cycle.sent || {};
     cycle.sent.reminder = true; // только что напомнили — второе напоминание в тот же час не нужно
   }
@@ -1253,6 +1332,11 @@ function advanceCycle(cycle, force) {
     case 'reading':
       if (force || now >= new Date(cycle.meetingAt).getTime() + MEETING_DURATION_HOURS * 60 * 60 * 1000) {
         startRating(cycle);
+      } else if (now >= new Date(cycle.meetingAt).getTime()) {
+        // Встреча уже идёт: напоминания «до встречи» опоздали — не шлём
+        cycle.sent.agenda = true;
+        cycle.sent.questions = true;
+        cycle.sent.checkpoint = true;
       } else if (!cycle.sent.agenda && before(cycle.meetingAt, AGENDA_REMINDER_HOURS)) {
         cycle.sent.agenda = true;
         cycle.sent.questions = true;
@@ -1730,6 +1814,13 @@ function handleTelegramUpdate(e) {
 
     const update = JSON.parse(e.postData.contents);
 
+    // Итоги опросов приходят на каждый голос и безопасны при повторе
+    // (запоминаем последние). В список защиты от повторов их не пишем —
+    // иначе они вытеснили бы оттуда настоящие команды.
+    if (update.poll) {
+      return handlePollUpdate(update.poll);
+    }
+
     // Защита от повторной доставки. Telegram может прислать один и тот же
     // апдейт несколько раз — уже обработанные update_id пропускаем
     // (храним список последних, см. markUpdateProcessed).
@@ -1827,9 +1918,10 @@ function setupTelegramWebhook(webAppUrl) {
   const separator = webAppUrl.includes('?') ? '&' : '?';
   const webhookUrlWithSecret = `${webAppUrl}${separator}secret=${encodeURIComponent(TELEGRAM_WEBHOOK_SECRET)}`;
 
-  // Только сообщения и кнопки: без этого Telegram присылает вебхук на каждый
-  // голос в опросах бота (лишние запуски скрипта и борьба за блокировку)
-  const setWebhook = callTelegram('setWebhook', { url: webhookUrlWithSecret, allowed_updates: ['message', 'callback_query'] });
+  // Сообщения, кнопки и итоги опросов бота ('poll' — на каждый голос, чтобы
+  // голоса не терялись, см. handlePollUpdate). Ответы конкретных людей
+  // (poll_answer) не нужны.
+  const setWebhook = callTelegram('setWebhook', { url: webhookUrlWithSecret, allowed_updates: ['message', 'callback_query', 'poll'] });
   Logger.log('setWebhook: ' + JSON.stringify(setWebhook));
 
   // В меню — только то, что нужно участникам. Админские команды работают,

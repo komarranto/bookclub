@@ -79,7 +79,11 @@ function makeContext(options = {}) {
     PropertiesService: {
       getScriptProperties: () => ({
         getProperty: (k) => (props.has(k) ? props.get(k) : null),
-        setProperty: (k, v) => { props.set(k, String(v)); },
+        setProperty: (k, v) => {
+          // Как в Apps Script: не больше 9 КБ (в байтах UTF-8) на значение
+          if (Buffer.byteLength(String(v), 'utf8') > 9216) throw new Error(`Значение свойства ${k} слишком большое`);
+          props.set(k, String(v));
+        },
         deleteProperty: (k) => { props.delete(k); }
       })
     },
@@ -119,11 +123,12 @@ function makeContext(options = {}) {
         if (url.endsWith('/sendPoll')) {
           const id = nextMessageId++;
           polls.set(id, { options: payload.options, votes: payload.options.map(() => 0), closed: false });
-          return respond({ ok: true, result: { message_id: id } });
+          return respond({ ok: true, result: { message_id: id, poll: { id: 'poll-' + id } } });
         }
         if (url.endsWith('/stopPoll')) {
           const poll = polls.get(payload.message_id);
           if (!poll) return respond({ ok: false, description: 'Bad Request: message to stop poll not found' });
+          if (poll.closed) return respond({ ok: false, description: 'Bad Request: poll has already been closed' });
           poll.closed = true;
           return respond({ ok: true, result: { options: poll.options.map((text, i) => ({ text, voter_count: poll.votes[i] })) } });
         }
@@ -413,7 +418,7 @@ test('13 заявок — два опроса (7 и 6), голоса сумми�
   for (let i = 0; i < 31; i++) {
     big.ctx.handleTelegramUpdate(groupMsg(`/suggest_book ${String(i).padStart(2, '0')} ` + 'я'.repeat(120), { id: 2000 + i, first_name: 'Ч' + i }));
   }
-  assert.ok(lastChat(big.fetchCalls).includes('это максимум'));
+  assert.ok(lastChat(big.fetchCalls).includes('Список заявок заполнен'));
   big.ctx.handleTelegramUpdate(groupMsg('/skip', ANTON));
   assert.ok(Buffer.byteLength(big.props.get('cycle'), 'utf8') < 9216, 'cycle помещается в лимит Script Properties');
 
@@ -969,6 +974,100 @@ test('Меню команд — только для участников, адм
   assert.ok(menu.length <= 11);
 });
 
+// ==================== НАДЁЖНОСТЬ (по итогам стресс-теста) ====================
+
+/** Как Telegram присылает вебхук 'poll' после голоса */
+function pollUpdate(t, messageId) {
+  const poll = t.polls.get(messageId);
+  return {
+    postData: { contents: JSON.stringify({ update_id: nextUpdateId++, poll: { id: 'poll-' + messageId,
+      options: poll.options.map((text, i) => ({ text, voter_count: poll.votes[i] })), is_closed: poll.closed } }) },
+    parameter: { secret: 'test-secret' }
+  };
+}
+
+test('Ответ на stopPoll потерялся (опрос закрыт, итогов нет) — голоса берутся из вебхуков, а не нули', () => {
+  let loseResponse = true;
+  const t = makeContext({
+    telegramResponse: (url, payload) => {
+      if (loseResponse && url.endsWith('/stopPoll')) {
+        loseResponse = false;
+        t.polls.get(payload.message_id).closed = true; // Telegram закрыл, но ответ не дошёл
+        return { ok: false, description: 'Bad Gateway' };
+      }
+      return null;
+    }
+  });
+  t.ctx.handleTelegramUpdate(groupMsg('/start_cycle', MASHA));
+  t.ctx.handleTelegramUpdate(groupMsg('/suggest_book Дюна', ANTON));
+  t.ctx.handleTelegramUpdate(groupMsg('/suggest_book Мор', MASHA));
+  let c = t.cycle();
+  tickAt(t, c.submitUntil, HOUR);
+  c = t.cycle();
+  t.vote(c.votePolls[0].messageId, [1, 5]);
+  t.ctx.handleTelegramUpdate(pollUpdate(t, c.votePolls[0].messageId));
+  tickAt(t, c.voteUntil, HOUR);      // stopPoll: опрос закрылся, ответ потерян
+  assert.strictEqual(t.cycle().phase, 'voting');
+  tickAt(t, c.voteUntil, 2 * HOUR);  // «already been closed» → последние известные голоса
+  assert.deepStrictEqual(t.cycle().book, { title: 'Мор', by: 'Маша', votes: 5 });
+});
+
+test('План встречи не приходит после начала встречи, даже если tick запоздал', () => {
+  const t = cycleWithSubmissions();
+  const c = readingCycle(t);
+  tickAt(t, c.meetingAt, 90 * 60 * 1000);
+  assert.strictEqual(texts(chatMessages(t.fetchCalls)).filter(x => x.includes('План встречи')).length, 0);
+  assert.ok(!texts(chatMessages(t.fetchCalls)).some(x => x.includes('Завтра встреча')));
+});
+
+test('Сбой при записи заголовков листа: следующая запись сначала восстанавливает заголовки', () => {
+  const t = makeContext();
+  const sheet = t.ss.insertSheet('История клуба'); // лист есть, а заголовков нет
+  t.ctx.handleTelegramUpdate(groupMsg('/start_cycle', MASHA));
+  t.ctx.handleTelegramUpdate(groupMsg('/suggest_book Дюна', ANTON));
+  readingCycle(t);
+  t.ctx.handleTelegramUpdate(groupMsg('/skip', ANTON));
+  t.ctx.handleTelegramUpdate(groupMsg('/skip', ANTON));
+  assert.strictEqual(sheet.getRange(1, 2).getValue(), 'Книга');
+  t.ctx.handleTelegramUpdate(groupMsg('/history', OLYA));
+  assert.ok(lastChat(t.fetchCalls).includes('«Дюна»'));
+});
+
+test('Не удалось обновить закреп — бот повторяет со следующим tick', () => {
+  let editBroken = true;
+  const t = makeContext({ telegramResponse: (url) => (editBroken && url.endsWith('/editMessageText')) ? { ok: false, description: 'Too Many Requests' } : null });
+  t.ctx.handleTelegramUpdate(groupMsg('/start_cycle', MASHA));
+  t.ctx.handleTelegramUpdate(groupMsg('/suggest_book Дюна', ANTON));
+  t.ctx.handleTelegramUpdate(groupMsg('/suggest_book Мор', MASHA));
+  const c = t.cycle();
+  tickAt(t, c.submitUntil, HOUR);
+  editBroken = false;
+  tickAt(t, c.submitUntil, 2 * HOUR);
+  const edits = t.fetchCalls.filter(x => x.url.endsWith('/editMessageText'));
+  assert.strictEqual(edits.length, 2);
+  assert.ok(edits[1].payload.text.includes('Голосование за книгу'));
+  tickAt(t, c.submitUntil, 3 * HOUR);
+  assert.strictEqual(t.fetchCalls.filter(x => x.url.endsWith('/editMessageText')).length, 2, 'после успеха лишних правок нет');
+});
+
+test('Длинные названия на кириллице и иероглифах: заявки ограничены по байтам, состояние цикла всегда сохраняется', () => {
+  for (const ch of ['я', '書']) {
+    const t = makeContext();
+    t.ctx.handleTelegramUpdate(groupMsg('/start_cycle', MASHA));
+    for (let i = 0; i < 31; i++) {
+      t.ctx.handleTelegramUpdate(groupMsg(`/suggest_book ${String(i).padStart(2, '0')} ` + ch.repeat(120), { id: 3000 + i, first_name: 'Читатель' + i }));
+    }
+    assert.ok(lastChat(t.fetchCalls).includes('Список заявок заполнен'));
+    const c = t.cycle();
+    tickAt(t, c.submitUntil, HOUR);
+    const v = t.cycle();
+    assert.strictEqual(v.phase, 'voting');
+    v.votePolls.forEach(p => t.vote(p.messageId, p.candidates.map((x, i) => i)));
+    tickAt(t, v.voteUntil, HOUR);
+    assert.strictEqual(t.cycle().phase, 'scheduling', `символ ${ch}: голосование закрылось, состояние сохранилось`);
+  }
+});
+
 // ==================== СТАТИСТИКА ====================
 
 test('/stats: топ книг, меньше всего зашла, чьи книги нравятся больше', () => {
@@ -1098,7 +1197,7 @@ test('setupTelegramWebhook: адрес из WEB_APP_URL с secret; пустой 
   t.ctx.setupTelegramWebhook();
   const setWebhook = t.fetchCalls.find(c => c.url.endsWith('/setWebhook')).payload;
   assert.strictEqual(setWebhook.url, 'https://script.google.com/macros/s/TEST/exec?secret=test-secret');
-  assert.deepStrictEqual(setWebhook.allowed_updates, ['message', 'callback_query'], 'без вебхука на каждый голос в опросах');
+  assert.deepStrictEqual(setWebhook.allowed_updates, ['message', 'callback_query', 'poll'], 'итоги опросов — да, ответы конкретных людей (poll_answer) — нет');
   assert.throws(() => t.ctx.setupTelegramWebhook('ВАШ_URL_ВЕБ_ПРИЛОЖЕНИЯ'), /WEB_APP_URL не задан/);
 });
 
