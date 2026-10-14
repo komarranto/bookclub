@@ -1068,6 +1068,42 @@ test('Длинные названия на кириллице и иерогли�
   }
 });
 
+// ==================== УБОРКА ТАБЛИЦЫ ====================
+
+test('🧹 Уборка: удаляются Fortnight и листы прошлых версий, листы бота и чужие листы остаются', () => {
+  const t = makeContext();
+  const { FakeSheet } = require('./fakes');
+  for (const name of ['Fortnight 98', 'Fortnight 97', 'Fortnite 12', 'Копия Fortnight 98', 'Achievements', 'Quotes',
+    'Questions', 'BookSuggestions', 'Мой лист', 'Вопросы к встрече']) {
+    t.ss.addSheet(new FakeSheet(name));
+  }
+  assert.strictEqual(t.ctx.cleanupOldSheets(true), 8);
+  const left = t.ss.getSheets().map(s => s.getName()).sort();
+  assert.deepStrictEqual(left, ['Вопросы к встрече', 'История клуба', 'Мой лист']);
+  assert.strictEqual(t.ctx.cleanupOldSheets(true), 0, 'повторно — нечего удалять');
+});
+
+test('🧹 Уборка, когда в таблице только старые листы: таблица не остаётся пустой', () => {
+  const t = makeContext();
+  const { FakeSheet } = require('./fakes');
+  t.ss.addSheet(new FakeSheet('Fortnight 1'));
+  t.ss.addSheet(new FakeSheet('Fortnight 2'));
+  assert.strictEqual(t.ctx.cleanupOldSheets(true), 2);
+  assert.deepStrictEqual(t.ss.getSheets().map(s => s.getName()), ['История клуба']);
+});
+
+test('🧹 Уборка из меню: без подтверждения ничего не удаляется', () => {
+  const t = makeContext();
+  const { FakeSheet } = require('./fakes');
+  t.ss.addSheet(new FakeSheet('Fortnight 1'));
+  t.ss.addSheet(new FakeSheet('Мой лист'));
+  t.ctx.SpreadsheetApp.getUi = () => ({ alert: () => 'NO', ButtonSet: { YES_NO: 'YES_NO' }, Button: { YES: 'YES' } });
+  assert.strictEqual(t.ctx.cleanupOldSheets(), 0);
+  assert.strictEqual(t.ss.getSheets().length, 2);
+  t.ctx.SpreadsheetApp.getUi = () => ({ alert: () => 'YES', ButtonSet: { YES_NO: 'YES_NO' }, Button: { YES: 'YES' } });
+  assert.strictEqual(t.ctx.cleanupOldSheets(), 1);
+});
+
 // ==================== СТАТИСТИКА ====================
 
 test('/stats: топ книг, меньше всего зашла, чьи книги нравятся больше', () => {

@@ -2028,6 +2028,7 @@ function onOpen() {
     .addItem('🚀 Обновить бота (триггер, меню команд, анонс)', 'setupBot')
     .addItem('📣 Отправить анонс ещё раз', 'resendAnnouncement')
     .addItem('⏱ Проверить цикл сейчас', 'tick')
+    .addItem('🧹 Удалить старые листы (Fortnight и прошлые версии)', 'cleanupOldSheets')
     .addSeparator()
     .addItem('🗑️ Удалить все триггеры', 'removeAllTriggers')
     .addToUi();
@@ -2036,6 +2037,66 @@ function onOpen() {
 /**
  * 🗑️ УДАЛИТЬ ВСЕ ТРИГГЕРЫ
  */
+// ==================== УБОРКА ТАБЛИЦЫ ====================
+
+// Листы прошлых версий бота: трекер чтения и данные старых механик
+const OLD_SHEET_NAMES = ['Achievements', 'Quotes', 'Questions', 'BookSuggestions'];
+
+function isOldSheetName(name) {
+  return /^Fortni(?:ght|te)\s*\d+/i.test(name) || /^(?:Копия|Copy of) Fortni(?:ght|te)/i.test(name) || OLD_SHEET_NAMES.includes(name);
+}
+
+/**
+ * 🧹 Удалить старые листы одним нажатием: все «Fortnight N» и служебные
+ * листы прошлых версий. Листы нового бота («Заявки», «Вопросы к встрече»,
+ * «История клуба») и любые другие листы не трогаются.
+ * Из меню — сначала показывает список и спрашивает подтверждение.
+ * confirmed = true — без вопроса (для запуска из кода/тестов).
+ */
+function cleanupOldSheets(confirmed) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const old = ss.getSheets().filter(sheet => isOldSheetName(sheet.getName()));
+  if (old.length === 0) {
+    notifyInSheet('Старых листов нет — всё уже чисто ✨');
+    return 0;
+  }
+
+  if (confirmed !== true) {
+    const ui = SpreadsheetApp.getUi();
+    const names = old.map(sheet => sheet.getName());
+    const shown = names.length > 25 ? names.slice(0, 25).join(', ') + ` и ещё ${names.length - 25}` : names.join(', ');
+    const answer = ui.alert('Удалить старые листы?',
+      `Будет удалено листов: ${names.length}\n\n${shown}\n\n` +
+      'Листы бота («Заявки», «Вопросы к встрече», «История клуба») и остальные не трогаются. ' +
+      'Отменить удаление потом можно только через копию таблицы или историю версий.',
+      ui.ButtonSet.YES_NO);
+    if (answer !== ui.Button.YES) return 0;
+  }
+
+  // В таблице должен остаться хотя бы один лист — заранее создаём лист истории
+  getOrCreateDataSheet(DATA_SHEETS.HISTORY);
+  let deleted = 0;
+  for (const sheet of old) {
+    try {
+      ss.deleteSheet(sheet);
+      deleted++;
+    } catch (error) {
+      Logger.log(`⚠️ Не удалось удалить лист «${sheet.getName()}»: ${error}`);
+    }
+  }
+  notifyInSheet(`Удалено старых листов: ${deleted} 🧹`);
+  return deleted;
+}
+
+function notifyInSheet(text) {
+  Logger.log(text);
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast(text, '📚 Книжный клуб', 5);
+  } catch (error) {
+    // из редактора без открытой таблицы тоста нет — хватит лога
+  }
+}
+
 function removeAllTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   for (const trigger of triggers) {

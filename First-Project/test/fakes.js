@@ -105,6 +105,11 @@ class FakeSpreadsheet {
     this.sheets.push(sheet);
     return sheet;
   }
+  deleteSheet(sheet) {
+    if (this.sheets.length <= 1) throw new Error('Нельзя удалить единственный лист');
+    this.sheets = this.sheets.filter(s => s !== sheet);
+  }
+  toast() {}
   addSheet(sheet) {
     this.sheets.push(sheet);
     return sheet;
