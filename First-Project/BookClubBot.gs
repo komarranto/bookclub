@@ -70,6 +70,12 @@ const MEETING_DONE_TEXT_TRIGGERS = ['встреча закончена', 'вст
 
 const USER_TEXT_MAX_LENGTH = 500;
 const POLL_MAX_OPTIONS = 12; // лимит вариантов в Telegram Poll
+const BOOK_TITLE_MAX_LENGTH = 100; // = лимит длины варианта в опросе
+// Всего заявок за цикл: состояние цикла хранится в Script Properties
+// (лимит 9 КБ на значение), 30 названий по 100 символов туда помещаются
+const MAX_SUBMISSIONS_PER_CYCLE = 30;
+const DATE_MOVES_PER_CYCLE = 2;   // сколько раз за цикл можно сдвинуть выбор даты (/another_time)
+const POLL_STOP_RETRIES = 6;      // сколько раз (по часу) пробовать закрыть опрос при сбое Telegram
 
 // Листы с данными в таблице, к которой привязан скрипт.
 // Видимые — «Вопросы к встрече» и «История клуба», их удобно открыть самому.
@@ -94,6 +100,7 @@ const OBSOLETE_TRIGGER_HANDLERS = ['sendWeeklyReport', 'createNextSprint'];
 // Анонс в чат отправляется один раз на каждое значение этой строки
 const ANNOUNCEMENT_ID = 'cycles-1';
 
+const RU_WEEKDAYS_SHORT = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 const RU_WEEKDAYS = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
 const RU_MONTHS_GENITIVE = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
                             'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
@@ -157,16 +164,53 @@ function sendPoll(question, options, extra = {}) {
 }
 
 /**
- * Закрыть опрос и получить итоги: массив голосов по вариантам
- * (в том же порядке). Если опрос не закрылся (удалили и т.п.) — нули.
+ * Закрыть опрос и получить итоги: массив голосов по вариантам (в том же
+ * порядке). Опроса нет (не отправился, удалён) — нули. Временный сбой
+ * Telegram (сеть, 5xx, 429) — null: этап подождёт и попробует в следующий
+ * час, а не объявит «0 голосов».
  */
 function stopPollCounts(messageId, optionsCount) {
   const zeros = new Array(optionsCount).fill(0);
   if (!messageId) return zeros;
   const result = callTelegram('stopPoll', { chat_id: TELEGRAM_CHAT_ID, message_id: messageId });
-  const poll = result && result.ok ? result.result : null;
+  if (!result || !result.ok) {
+    const permanent = /not found|already been closed|can't be stopped|message to stop/i.test(String(result && result.description));
+    return permanent ? zeros : null;
+  }
+  const poll = result.result;
   if (!poll || !Array.isArray(poll.options)) return zeros;
   return zeros.map((z, i) => (poll.options[i] ? Number(poll.options[i].voter_count) || 0 : 0));
+}
+
+/**
+ * Итоги опроса цикла с сохранением: результат запоминается в самом опросе
+ * (holder.counts) и цикл сразу сохраняется — если дальше что-то упадёт,
+ * голоса не потеряются. null — Telegram пока не ответил, ждём следующего часа.
+ */
+function collectPollCounts(cycle, holder, messageId, optionsCount) {
+  if (holder.counts) return holder.counts;
+  let counts = stopPollCounts(messageId, optionsCount);
+  if (counts === null) {
+    holder.stopFailures = (holder.stopFailures || 0) + 1;
+    if (holder.stopFailures < POLL_STOP_RETRIES) {
+      Logger.log(`⚠️ Не удалось закрыть опрос ${messageId} — попробую через час`);
+      return null;
+    }
+    Logger.log(`❌ Опрос ${messageId} так и не закрылся — считаю без его голосов`);
+    counts = new Array(optionsCount).fill(0);
+  }
+  holder.counts = counts;
+  saveCycle(cycle);
+  return counts;
+}
+
+/** Опрос в чат; не отправился — предупреждение в чат (обычно боту запрещены опросы) */
+function sendPollOrWarn(question, options, extra) {
+  const messageId = sendPoll(question, options, extra);
+  if (!messageId) {
+    sendChatText('⚠️ Не получилось отправить опрос. Проверьте, что боту разрешено отправлять опросы в группе. Админ может повторить этап: /skip');
+  }
+  return messageId;
 }
 
 function getChatMemberStatus(userId) {
@@ -208,13 +252,20 @@ function writeJsonProperty(key, value) {
  */
 function withScriptLock(fn) {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) {
+  if (!lock.tryLock(25000)) {
     Logger.log('⚠️ Не удалось получить блокировку — действие пропущено');
     return null;
   }
   try {
     return fn();
   } finally {
+    // Дописать изменения таблицы до снятия блокировки — иначе параллельный
+    // вызов может увидеть старый getLastRow() и записать в ту же строку
+    try {
+      if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
+    } catch (error) {
+      Logger.log('⚠️ flush: ' + error);
+    }
     lock.releaseLock();
   }
 }
@@ -275,10 +326,25 @@ function formatDateRu(date) {
   return `${RU_WEEKDAYS[date.getDay()]}, ${date.getDate()} ${RU_MONTHS_GENITIVE[date.getMonth()]}`;
 }
 
-/** Срок этапа: 'вторник, 21 октября, 19:00' */
+/** Срок этапа: '21 октября (вт), 19:00' — читается после «до», «после», «закрывается» */
 function formatDeadline(isoOrDate) {
   const d = new Date(isoOrDate);
-  return `${formatDateRu(d)}, ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return `${d.getDate()} ${RU_MONTHS_GENITIVE[d.getMonth()]} (${RU_WEEKDAYS_SHORT[d.getDay()]}), ` +
+    `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/** Сколько осталось до момента: 'через 2 часа', 'через 40 минут', 'уже сейчас' */
+function formatTimeLeft(iso) {
+  const minutes = Math.round((new Date(iso).getTime() - Date.now()) / 60000);
+  if (minutes <= 5) return 'уже сейчас';
+  if (minutes < 60) return `через ${minutes} ${pluralRu(minutes, 'минуту', 'минуты', 'минут')}`;
+  const hours = Math.round(minutes / 60);
+  return `через ${hours} ${pluralRu(hours, 'час', 'часа', 'часов')}`;
+}
+
+/** Сравнение названий: без регистра, лишних пробелов и кавычек */
+function normalizeTitle(title) {
+  return String(title).toLowerCase().replace(/[«»"'“”„]/g, '').replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -304,6 +370,10 @@ function getUpcomingWeekend(targetDate) {
   const saturday = addDays(date, (6 - date.getDay() + 7) % 7);
   const sunday = addDays(saturday, 1);
   return { saturday, sunday };
+}
+
+function daysText(n) {
+  return `${n} ${pluralRu(n, 'день', 'дня', 'дней')}`;
 }
 
 function pluralRu(n, one, few, many) {
@@ -355,7 +425,9 @@ function readDataRows(def) {
  */
 function appendDataRow(def, values) {
   const sheet = getOrCreateDataSheet(def);
-  sheet.getRange(sheet.getLastRow() + 1, 1, 1, values.length).setValues([values]);
+  // Текст, начинающийся с = + - @, таблица приняла бы за формулу
+  const safe = values.map(v => (typeof v === 'string' && /^[=+\-@]/.test(v) ? "'" + v : v));
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, safe.length).setValues([safe]);
 }
 
 // ==================== СОСТОЯНИЕ ЦИКЛА ====================
@@ -412,9 +484,9 @@ function formatTimeline(cycle) {
   };
   const lines = [];
   lines.push(`${mark('submissions')} Заявки (до ${BOOKS_PER_MEMBER} книг на человека) — до ${formatDeadline(cycle.submitUntil)}`);
-  lines.push(`${mark('voting')} Голосование за книгу — ${cycle.voteUntil ? 'до ' + formatDeadline(cycle.voteUntil) : `${CYCLE_VOTE_DAYS} дня после заявок`}`);
-  lines.push(`${mark('scheduling')} Выбор даты встречи — ${cycle.dateVoteUntil ? 'до ' + formatDeadline(cycle.dateVoteUntil) : `${CYCLE_DATE_VOTE_DAYS} дня после голосования`}`);
-  lines.push(`${mark('reading')} Чтение и вопросы к встрече — ${cycle.meetingAt ? 'до встречи' : `около ${CYCLE_READING_WEEKS} недель`}`);
+  lines.push(`${mark('voting')} Голосование за книгу — ${cycle.voteUntil ? 'до ' + formatDeadline(cycle.voteUntil) : `${daysText(CYCLE_VOTE_DAYS)} после заявок`}`);
+  lines.push(`${mark('scheduling')} Выбор даты встречи — ${cycle.dateVoteUntil ? 'до ' + formatDeadline(cycle.dateVoteUntil) : `${daysText(CYCLE_DATE_VOTE_DAYS)} после голосования`}`);
+  lines.push(`${mark('reading')} Чтение и вопросы к встрече — ${cycle.meetingAt ? 'до встречи' : `около ${CYCLE_READING_WEEKS} ${pluralRu(CYCLE_READING_WEEKS, 'недели', 'недель', 'недель')}`}`);
   lines.push(`${mark('rating')} Встреча и оценка книги — ${cycle.meetingAt ? formatMeeting(cycle.meetingAt) : 'выходные, дату выберем опросом'}`);
   return lines.join('\n');
 }
@@ -437,7 +509,10 @@ function handleStartCycleCommand() {
     saveCycle(cycle);
     return { cycle: cycle };
   });
-  if (!created) return;
+  if (!created) {
+    sendChatText('Бот сейчас занят — попробуй ещё раз через минуту.');
+    return;
+  }
   if (created.busy) {
     sendChatText(`Уже идёт цикл #${created.busy.id} (${PHASE_TITLES[created.busy.phase]}). Подробности: /status`);
     return;
@@ -459,25 +534,36 @@ function handleSuggestBookCommand(from, args, reply) {
       : 'Сейчас заявки не принимаются. Начать новый цикл выбора книги: /start_cycle');
     return;
   }
-  const title = sanitizeUserText(args, 150);
+  const title = sanitizeUserText(args, BOOK_TITLE_MAX_LENGTH).replace(/^[«"“„']+|[»"”']+$/g, '').trim();
   if (!title) {
     reply('Напиши название после команды: /suggest_book Мастер и Маргарита');
     return;
   }
 
   const result = withScriptLock(() => {
+    // Перепроверяем под блокировкой: заявки могли закрыться, пока ждали
+    const fresh = getCycle();
+    if (!fresh || fresh.id !== cycle.id || fresh.phase !== 'submissions') return { closed: true };
     const books = getCycleBooks(cycle.id);
-    if (books.some(b => b.title.toLowerCase() === title.toLowerCase())) return { duplicate: true };
+    if (books.some(b => normalizeTitle(b.title) === normalizeTitle(title))) return { duplicate: true };
     const mine = books.filter(b => b.authorId === String(from.id));
     if (mine.length >= BOOKS_PER_MEMBER) return { limit: mine };
+    if (books.length >= MAX_SUBMISSIONS_PER_CYCLE) return { full: true };
     appendDataRow(DATA_SHEETS.CYCLE_BOOKS, [cycle.id, new Date(), getAuthorName(from), String(from.id), title]);
     return { count: books.length + 1, mine: mine.length + 1 };
   });
-  if (!result) return;
-  if (result.duplicate) {
+  if (!result) {
+    reply('Не получилось сохранить — попробуй ещё раз через минуту.');
+    return;
+  }
+  if (result.full) {
+    reply(`В цикле уже ${MAX_SUBMISSIONS_PER_CYCLE} заявок — это максимум. Голосование — после ${formatDeadline(cycle.submitUntil)}.`);
+  } else if (result.closed) {
+    reply('Приём заявок только что закрылся. Что сейчас: /status');
+  } else if (result.duplicate) {
     reply(`📚 «${title}» уже есть в заявках.`);
   } else if (result.limit) {
-    reply(`У тебя уже ${BOOKS_PER_MEMBER} заявки: ${result.limit.map(b => '«' + b.title + '»').join(', ')}. Заменить: /remove_book номер (номера — в /books)`);
+    reply(`У тебя уже ${BOOKS_PER_MEMBER} ${pluralRu(BOOKS_PER_MEMBER, 'заявка', 'заявки', 'заявок')}: ${result.limit.map(b => '«' + b.title + '»').join(', ')}. Заменить: /remove_book номер (номера — в /books)`);
   } else {
     reply(`📚 «${title}» — в заявках (твоих: ${result.mine} из ${BOOKS_PER_MEMBER}, всего: ${result.count}). Голосование — после ${formatDeadline(cycle.submitUntil)}.`);
   }
@@ -567,7 +653,7 @@ function closeSubmissions(cycle) {
     const indexes = [];
     for (let i = c * size; i < Math.min(books.length, (c + 1) * size); i++) indexes.push(i);
     const question = `📚 Цикл #${cycle.id}: какую книгу читаем?` + (chunks > 1 ? ` (опрос ${c + 1} из ${chunks})` : '');
-    const messageId = sendPoll(question, indexes.map(i => books[i].title), { multiple: true, anonymous: true });
+    const messageId = sendPollOrWarn(question, indexes.map(i => books[i].title), { multiple: true, anonymous: true });
     cycle.votePolls.push({ messageId: messageId, candidates: indexes });
   }
 }
@@ -578,7 +664,8 @@ function closeSubmissions(cycle) {
 function closeVoting(cycle) {
   const votes = cycle.candidates.map(() => 0);
   for (const poll of cycle.votePolls || []) {
-    const counts = stopPollCounts(poll.messageId, poll.candidates.length);
+    const counts = collectPollCounts(cycle, poll, poll.messageId, poll.candidates.length);
+    if (!counts) return; // Telegram не ответил — повторим через час
     poll.candidates.forEach((candidateIndex, i) => { votes[candidateIndex] += counts[i]; });
   }
   const best = Math.max(...votes);
@@ -622,7 +709,7 @@ function startScheduling(cycle, targetDate) {
   const tail = `Какое время подходит? Время — ${MEETING_TIMEZONE_LABEL}. Можно выбрать несколько.`;
   cycle.datePolls = [saturday, sunday].map(day => ({
     date: day.toISOString(),
-    messageId: sendPoll(`📅 Встреча по «${cycle.book.title}» — ${formatDateRu(day)}. ${tail}`, MEETING_TIME_SLOTS, { multiple: true })
+    messageId: sendPollOrWarn(`📅 Встреча по «${cycle.book.title}» — ${formatDateRu(day)}. ${tail}`, MEETING_TIME_SLOTS, { multiple: true })
   }));
   sendChatText(`📅 Выбираем время встречи — голосуйте в опросах выше до ${formatDeadline(cycle.dateVoteUntil)}.\nНе подходят эти выходные — /another_time (сдвинуть на неделю).`);
 }
@@ -631,7 +718,8 @@ function startScheduling(cycle, targetDate) {
 function closeScheduling(cycle) {
   let best = { votes: 0, iso: null };
   for (const poll of cycle.datePolls || []) {
-    const counts = stopPollCounts(poll.messageId, MEETING_TIME_SLOTS.length);
+    const counts = collectPollCounts(cycle, poll, poll.messageId, MEETING_TIME_SLOTS.length);
+    if (!counts) return; // Telegram не ответил — повторим через час
     counts.forEach((votes, i) => {
       if (votes > best.votes) best = { votes: votes, iso: meetingIso(new Date(poll.date), MEETING_TIME_SLOTS[i]) };
     });
@@ -669,8 +757,14 @@ function handleQuestionCommand(from, args, reply, anonymous) {
     reply('Напиши вопрос после команды: /question Почему герой так поступил в финале?');
     return;
   }
-  withScriptLock(() => appendDataRow(DATA_SHEETS.QUESTIONS,
-    [cycle.id, cycle.book.title, new Date(), anonymous ? 'аноним' : getAuthorName(from), text]));
+  const saved = withScriptLock(() => {
+    appendDataRow(DATA_SHEETS.QUESTIONS, [cycle.id, cycle.book.title, new Date(), anonymous ? 'аноним' : getAuthorName(from), text]);
+    return true;
+  });
+  if (!saved) {
+    reply('Не получилось сохранить вопрос — попробуй ещё раз через минуту.');
+    return;
+  }
   const count = getCycleQuestions(cycle.id).length;
   reply(`❓ Вопрос к встрече по «${cycle.book.title}» сохранён (всего: ${count}). Список: /questions`);
 }
@@ -705,7 +799,9 @@ function sendCheckpoint(cycle) {
 function sendQuestionsReminder(cycle) {
   const questions = getCycleQuestions(cycle.id);
   const url = getSpreadsheetUrl();
-  let text = `⏰ Завтра встреча по «${cycle.book.title}» — ${formatMeeting(cycle.meetingAt)}\n🎙 Ведущий: ${cycle.moderator}\n\n`;
+  const hoursLeft = (new Date(cycle.meetingAt).getTime() - Date.now()) / (60 * 60 * 1000);
+  const when = hoursLeft >= 12 ? 'Завтра встреча' : `Встреча ${formatTimeLeft(cycle.meetingAt)}`;
+  let text = `⏰ ${when} по «${cycle.book.title}» — ${formatMeeting(cycle.meetingAt)}\n🎙 Ведущий: ${cycle.moderator}\n\n`;
   text += questions.length > 0
     ? `❓ Вопросы к обсуждению (${questions.length}):\n\n${formatQuestionsList(questions)}`
     : '❓ Вопросов пока нет — самое время добавить: /question текст\n';
@@ -714,7 +810,8 @@ function sendQuestionsReminder(cycle) {
 }
 
 function sendAgenda(cycle) {
-  let text = `📋 Через ${AGENDA_REMINDER_HOURS} ${pluralRu(AGENDA_REMINDER_HOURS, 'час', 'часа', 'часов')} встреча по «${cycle.book.title}»!\n🎙 Ведущий: ${cycle.moderator}\n\nРегламент:\n`;
+  const left = formatTimeLeft(cycle.meetingAt);
+  let text = `📋 Встреча по «${cycle.book.title}» — ${left}!\n🎙 Ведущий: ${cycle.moderator}\n\nРегламент:\n`;
   MEETING_AGENDA.forEach((item, i) => { text += `${i + 1}. ${item}\n`; });
   text += '\nСписок вопросов: /questions';
   sendChatText(text);
@@ -726,7 +823,7 @@ function startRating(cycle) {
   cycle.phase = 'rating';
   cycle.rateUntil = deadlineAfterDays(new Date(), CYCLE_RATING_DAYS).toISOString();
   cycle.sent = {};
-  cycle.ratingPoll = sendPoll(`⭐ Как вам «${cycle.book.title}»?`, RATING_OPTIONS, { anonymous: true });
+  cycle.ratingPoll = sendPollOrWarn(`⭐ Как вам «${cycle.book.title}»?`, RATING_OPTIONS, { anonymous: true });
   sendChatText(`Спасибо за встречу! 🙌 Оцените книгу в опросе выше — он открыт до ${formatDeadline(cycle.rateUntil)}. Анонимно.`);
 }
 
@@ -735,7 +832,7 @@ function handleMeetingDoneCommand() {
   const done = withScriptLock(() => {
     const cycle = getCycle();
     if (!cycle || cycle.phase !== 'reading') return { cycle: cycle };
-    if (Date.now() < new Date(cycle.meetingAt).getTime() - 12 * 60 * 60 * 1000) return { early: cycle };
+    if (Date.now() < new Date(cycle.meetingAt).getTime() - 60 * 60 * 1000) return { early: cycle };
     startRating(cycle);
     saveCycle(cycle);
     return { ok: true };
@@ -752,14 +849,20 @@ function handleMeetingDoneCommand() {
 
 /** Конец оценки: средняя оценка → лист «История клуба» → итоги в чат */
 function closeRating(cycle) {
-  const counts = stopPollCounts(cycle.ratingPoll, RATING_OPTIONS.length);
+  cycle.ratingResult = cycle.ratingResult || {};
+  const counts = collectPollCounts(cycle, cycle.ratingResult, cycle.ratingPoll, RATING_OPTIONS.length);
+  if (!counts) return; // Telegram не ответил — повторим через час
   const total = counts.reduce((s, v) => s + v, 0);
   const sum = counts.reduce((s, v, i) => s + v * (5 - i), 0);
   const avg = total > 0 ? Math.round((sum / total) * 10) / 10 : '';
   const questions = getCycleQuestions(cycle.id).length;
 
-  appendDataRow(DATA_SHEETS.HISTORY, [cycle.id, cycle.book.title, cycle.book.by, cycle.book.votes,
-    new Date(cycle.meetingAt), avg, total, questions, cycle.moderator || '']);
+  if (!cycle.historyWritten) {
+    appendDataRow(DATA_SHEETS.HISTORY, [cycle.id, cycle.book.title, cycle.book.by, cycle.book.votes,
+      new Date(cycle.meetingAt), avg, total, questions, cycle.moderator || '']);
+    cycle.historyWritten = true;
+    saveCycle(cycle);
+  }
   cycle.rating = { avg: avg, total: total };
   cycle.phase = 'done';
   cycle.sent = {};
@@ -781,8 +884,13 @@ function tick() {
   withScriptLock(() => {
     const cycle = getCycle();
     if (!isCycleActive(cycle)) return;
-    advanceCycle(cycle, false);
-    saveCycle(cycle);
+    try {
+      advanceCycle(cycle, false);
+    } finally {
+      // Сохраняем даже при ошибке: отправленные опросы и флаги напоминаний
+      // не должны потеряться, иначе через час всё уйдёт в чат повторно
+      saveCycle(cycle);
+    }
   });
 }
 
@@ -851,6 +959,10 @@ function handleStatusCommand() {
     sendChatText('Циклов ещё не было. Начать выбор книги: /start_cycle');
     return;
   }
+  if (cycle.cancelled) {
+    sendChatText(`Цикл #${cycle.id} был отменён. Начать новый: /start_cycle`);
+    return;
+  }
   let text = `📚 Цикл #${cycle.id}` + (cycle.book ? ` — «${cycle.book.title}»` : '') + `\nСейчас: ${PHASE_TITLES[cycle.phase]}\n\n`;
   text += formatTimeline(cycle);
   if (cycle.moderator && cycle.phase !== 'done') text += `\n\n🎙 Ведущий встречи: ${cycle.moderator}`;
@@ -871,6 +983,8 @@ function handleAnotherTimeCommand() {
   const moved = withScriptLock(() => {
     const cycle = getCycle();
     if (!cycle || cycle.phase !== 'scheduling') return false;
+    if ((cycle.dateMoves || 0) >= DATE_MOVES_PER_CYCLE) return 'limit';
+    cycle.dateMoves = (cycle.dateMoves || 0) + 1;
     for (const poll of cycle.datePolls || []) {
       if (poll.messageId) callTelegram('stopPoll', { chat_id: TELEGRAM_CHAT_ID, message_id: poll.messageId });
     }
@@ -880,6 +994,10 @@ function handleAnotherTimeCommand() {
   });
   if (moved === false) {
     sendChatText('Сдвинуть дату можно, пока идёт выбор даты встречи. Что сейчас: /status');
+  } else if (moved === 'limit') {
+    sendChatText(`Дату в этом цикле уже сдвигали ${DATE_MOVES_PER_CYCLE} раза. Назначить вручную может админ: /set_meeting ДД.ММ ЧЧ:ММ`);
+  } else if (moved === null) {
+    sendChatText('Бот сейчас занят — попробуй ещё раз через минуту.');
   }
 }
 
@@ -894,13 +1012,18 @@ function handleAdminCommand(command, from, args) {
     if (!isCycleActive(cycle)) return 'Сейчас цикл не идёт. Начать: /start_cycle';
 
     if (command === 'skip') {
-      advanceCycle(cycle, true);
-      saveCycle(cycle);
+      try {
+        advanceCycle(cycle, true);
+      } finally {
+        saveCycle(cycle);
+      }
       return null;
     }
     if (command === 'cancel_cycle') {
-      for (const poll of (cycle.votePolls || []).concat(cycle.datePolls || [])) {
-        if (poll.messageId) callTelegram('stopPoll', { chat_id: TELEGRAM_CHAT_ID, message_id: poll.messageId });
+      const open = (cycle.votePolls || []).concat(cycle.datePolls || []).map(p => p.messageId);
+      if (cycle.ratingPoll) open.push(cycle.ratingPoll);
+      for (const messageId of open) {
+        if (messageId) callTelegram('stopPoll', { chat_id: TELEGRAM_CHAT_ID, message_id: messageId });
       }
       cycle.phase = 'done';
       cycle.cancelled = true;
@@ -909,14 +1032,22 @@ function handleAdminCommand(command, from, args) {
     }
     if (command === 'set_meeting') {
       if (!cycle.book) return 'Сначала нужно выбрать книгу.';
+      if (!['scheduling', 'reading'].includes(cycle.phase)) return 'Дату встречи можно менять только до встречи.';
       const m = String(args).match(/^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s+(\d{1,2}):(\d{2})$/);
       if (!m) return `Формат: /set_meeting 22.11 12:00 (время — ${MEETING_TIMEZONE_LABEL})`;
+      const day = Number(m[1]);
+      const month = Number(m[2]) - 1;
+      const hour = Number(m[4]);
+      const minute = Number(m[5]);
       const now = new Date();
-      let year = m[3] ? Number(m[3]) : now.getFullYear();
-      let iso = new Date(Date.UTC(year, Number(m[2]) - 1, Number(m[1]), Number(m[4]), Number(m[5]))).toISOString();
-      if (!m[3] && new Date(iso).getTime() < now.getTime() - 24 * 60 * 60 * 1000) {
-        iso = new Date(Date.UTC(year + 1, Number(m[2]) - 1, Number(m[1]), Number(m[4]), Number(m[5]))).toISOString();
-      }
+      const build = (year) => new Date(Date.UTC(year, month, day, hour, minute));
+      const valid = (d) => d.getUTCDate() === day && d.getUTCMonth() === month && hour < 24 && minute < 60;
+      let when = build(m[3] ? Number(m[3]) : now.getFullYear());
+      // Без года и дата уже давно прошла — значит, имеется в виду следующий год
+      if (!m[3] && when.getTime() < now.getTime() - 30 * 24 * 60 * 60 * 1000) when = build(now.getFullYear() + 1);
+      if (!valid(when) || when.getFullYear() < 2000) return 'Такой даты нет. Формат: /set_meeting 22.11 12:00';
+      if (when.getTime() <= now.getTime()) return 'Эта дата уже прошла — укажи будущую.';
+      const iso = when.toISOString();
       for (const poll of cycle.datePolls || []) {
         if (poll.messageId && cycle.phase === 'scheduling') callTelegram('stopPoll', { chat_id: TELEGRAM_CHAT_ID, message_id: poll.messageId });
       }
@@ -1058,7 +1189,10 @@ function handleGroupMessage(message) {
   const cmd = parseCommand(text);
   const reply = (t) => sendChatText(t);
 
-  if ((cmd && cmd.command === 'meeting_done') || MEETING_DONE_TEXT_TRIGGERS.some(t => textLower.startsWith(t))) {
+  // Текстовый триггер — только сообщение целиком («Встреча закончена!»),
+  // а не любая фраза, которая так начинается
+  const bare = textLower.replace(/[\s!.…🎉]+$/u, '');
+  if ((cmd && cmd.command === 'meeting_done') || MEETING_DONE_TEXT_TRIGGERS.includes(bare)) {
     handleMeetingDoneCommand();
     return;
   }
@@ -1207,9 +1341,12 @@ function markUpdateProcessed(updateId) {
   if (updateId === undefined || updateId === null) return true; // нет id — не мешаем
 
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) {
-    Logger.log('⚠️ Не удалось получить блокировку для проверки update_id — считаю повтором');
-    return false;
+  if (!lock.tryLock(25000)) {
+    // Бот занят (например, tick закрывает этап). Молча выбросить команду
+    // хуже, чем рискнуть редким дублем: обрабатываем, команда сама ответит
+    // «попробуй ещё раз», если ей тоже понадобится блокировка.
+    Logger.log('⚠️ Не удалось получить блокировку для проверки update_id — обрабатываю без проверки');
+    return true;
   }
 
   try {
@@ -1255,7 +1392,9 @@ function setupTelegramWebhook(webAppUrl) {
   const separator = webAppUrl.includes('?') ? '&' : '?';
   const webhookUrlWithSecret = `${webAppUrl}${separator}secret=${encodeURIComponent(TELEGRAM_WEBHOOK_SECRET)}`;
 
-  const setWebhook = callTelegram('setWebhook', { url: webhookUrlWithSecret });
+  // Только сообщения и кнопки: без этого Telegram присылает вебхук на каждый
+  // голос в опросах бота (лишние запуски скрипта и борьба за блокировку)
+  const setWebhook = callTelegram('setWebhook', { url: webhookUrlWithSecret, allowed_updates: ['message', 'callback_query'] });
   Logger.log('setWebhook: ' + JSON.stringify(setWebhook));
 
   const setCommands = callTelegram('setMyCommands', {
@@ -1338,9 +1477,9 @@ function resendAnnouncement() {
 function formatAnnouncement() {
   return '📚 Бот клуба: теперь у нас понятный цикл с датами\n\n' +
     'Каждая книга проходит одни и те же этапы, бот сам напоминает и двигает сроки:\n\n' +
-    `1️⃣ Заявки (${CYCLE_SUBMIT_DAYS} дней) — каждый предлагает до ${BOOKS_PER_MEMBER} книг: /suggest_book название\n` +
-    `2️⃣ Голосование (${CYCLE_VOTE_DAYS} дня) — анонимный опрос из всех заявок\n` +
-    `3️⃣ Дата встречи (${CYCLE_DATE_VOTE_DAYS} дня) — опросы на выходные примерно через ${CYCLE_READING_WEEKS} недель\n` +
+    `1️⃣ Заявки (${daysText(CYCLE_SUBMIT_DAYS)}) — каждый предлагает до ${BOOKS_PER_MEMBER} ${pluralRu(BOOKS_PER_MEMBER, 'книги', 'книг', 'книг')}: /suggest_book название\n` +
+    `2️⃣ Голосование (${daysText(CYCLE_VOTE_DAYS)}) — анонимный опрос из всех заявок\n` +
+    `3️⃣ Дата встречи (${daysText(CYCLE_DATE_VOTE_DAYS)}) — опросы на выходные примерно через ${CYCLE_READING_WEEKS} ${pluralRu(CYCLE_READING_WEEKS, 'неделю', 'недели', 'недель')}\n` +
     '4️⃣ Чтение — копим вопросы к обсуждению (/question текст, в личку боту — анонимно). ' +
     'На полпути — короткий чекпоинт, за сутки — общий список вопросов, за 2 часа — регламент встречи\n' +
     '5️⃣ После встречи — анонимная оценка «Как вам книга?» от 1 до 5\n' +
