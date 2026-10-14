@@ -229,8 +229,13 @@ test('Полный цикл: старт → заявки → голосован�
   const submitUntil = new Date(c.submitUntil);
   assert.strictEqual(submitUntil.getTime(), new Date(2026, 9, 23, 19, 0, 0).getTime(), 'заявки — 7 дней, до 23 октября 19:00');
   assert.strictEqual(submitUntil.getHours(), 19, 'срок — 19:00');
-  const start = lastChat(fetchCalls);
-  assert.ok(start.includes('Цикл #1 начался') && start.includes('до 23 октября (пт), 19:00') && start.includes('/suggest_book'));
+  const start = texts(chatMessages(fetchCalls)).find(x => x.includes('Цикл #1 начался'));
+  assert.ok(start.includes('до 23 октября (пт), 19:00') && start.includes('/suggest_book Пикник на обочине — Стругацкие'));
+  assert.ok(start.includes('просто нажми /suggest_book'), 'объяснено, что можно нажать команду без текста');
+  const pinned = lastChat(fetchCalls);
+  assert.ok(pinned.startsWith('📌 Цикл #1') && pinned.includes('Расписание обновляется само'));
+  const pin = fetchCalls.find(x => x.url.endsWith('/pinChatMessage'));
+  assert.ok(pin && pin.payload.message_id === c.pinnedMessageId || pin.payload.message_id === t.cycle().pinnedMessageId, 'расписание закреплено');
 
   ctx.handleTelegramUpdate(groupMsg('/start_process', ANTON));
   assert.ok(lastChat(fetchCalls).includes('Уже идёт цикл #1'), '/start_process — синоним, второй цикл не стартует');
@@ -263,8 +268,10 @@ test('Полный цикл: старт → заявки → голосован�
   assert.strictEqual(c.phase, 'voting');
   const votePoll = pollCalls(fetchCalls).pop();
   assert.deepStrictEqual(votePoll.payload.options, ['Дюна', 'Мор', 'Пикник на обочине', 'Стоунер'], 'в опросе — только названия, без имён');
-  assert.strictEqual(votePoll.payload.is_anonymous, true);
+  assert.strictEqual(votePoll.payload.is_anonymous, false, 'голосование за книгу публичное');
   assert.strictEqual(votePoll.payload.allows_multiple_answers, true);
+  const voteHowTo = texts(chatMessages(fetchCalls)).find(x => x.includes('Шаг 2 из 5'));
+  assert.ok(voteHowTo.includes('голоса видны всем') && voteHowTo.includes('Отменить голос') && voteHowTo.includes('можно несколько'));
   t.vote(c.votePolls[0].messageId, [1, 0, 3, 2]);
 
   tickAt(t, c.voteUntil, -23 * HOUR);
@@ -292,7 +299,7 @@ test('Полный цикл: старт → заявки → голосован�
   // Вопросы можно задавать, как только книга выбрана
   ctx.handleTelegramUpdate(groupMsg('/question Что такое Зона?', OLYA));
   ctx.handleTelegramUpdate(privateMsg('/question Почему Рэдрик пошёл к Шару?', MASHA));
-  assert.ok(dmMessages(fetchCalls, 222).pop().payload.text.includes('всего: 2'));
+  assert.ok(dmMessages(fetchCalls, 222).pop().payload.text.includes('сохранён (анонимно). Всего вопросов: 2'));
 
   tickAt(t, c.dateVoteUntil, 30 * 60 * 1000);
   c = t.cycle();
@@ -329,7 +336,7 @@ test('Полный цикл: старт → заявки → голосован�
   c = t.cycle();
   assert.strictEqual(c.phase, 'rating');
   const ratingPoll = pollCalls(fetchCalls).pop();
-  assert.ok(ratingPoll.payload.question.includes('Как вам «Пикник на обочине»'));
+  assert.ok(ratingPoll.payload.question.includes('Как тебе «Пикник на обочине»? Оценка от 1 до 5 (анонимно)'));
   assert.strictEqual(ratingPoll.payload.is_anonymous, true);
   assert.strictEqual(ratingPoll.payload.options.length, 5);
   t.vote(c.ratingPoll, [3, 1, 0, 0, 0]);
@@ -521,7 +528,8 @@ test('/status показывает этап, все даты и подсказк
   const s = lastChat(t.fetchCalls);
   assert.ok(s.includes('Сейчас: 📥 Приём заявок'));
   assert.ok(s.includes('👉 Заявки') && s.includes('▫️ Голосование'));
-  assert.ok(s.includes('Предложить книгу: /suggest_book'));
+  assert.ok(s.includes('👉 Сейчас: предложи до 2 книг — /suggest_book'));
+  assert.ok(s.includes('/guide'));
 });
 
 test('tick, вызванный дважды в одно время, не дублирует сообщения и опросы', () => {
@@ -550,7 +558,7 @@ test('Сбой Telegram при закрытии опроса: этап ждёт 
   t.vote(c.votePolls[0].messageId, [0, 9]);
   tickAt(t, c.voteUntil, HOUR);
   assert.strictEqual(t.cycle().phase, 'voting', 'при сбое этап не закрывается');
-  assert.ok(!texts(chatMessages(t.fetchCalls)).some(x => x.includes('жребий')));
+  assert.ok(!texts(chatMessages(t.fetchCalls)).some(x => x.includes('бот бросил жребий')));
   failStop = false;
   tickAt(t, c.voteUntil, 2 * HOUR);
   c = t.cycle();
@@ -671,6 +679,137 @@ test('Формула в названии не превращается в фор
   assert.strictEqual(String(t.ss.getSheetByName('Заявки').getRange(2, 5).getValue()).charAt(0), "'");
 });
 
+// ==================== ПРОСТОТА ДЛЯ УЧАСТНИКОВ ====================
+
+test('Нажал /suggest_book без названия — бот просит прислать ответом, ответ становится заявкой', () => {
+  const t = makeContext();
+  t.ctx.handleTelegramUpdate(groupMsg('/start_cycle', MASHA));
+  t.ctx.handleTelegramUpdate(groupMsg('/suggest_book', ANTON));
+  const prompt = chatMessages(t.fetchCalls).pop();
+  assert.ok(prompt.payload.text.includes('ответом на это сообщение'));
+  assert.strictEqual(prompt.payload.reply_markup.force_reply, true);
+  assert.strictEqual(prompt.payload.reply_markup.selective, true, 'поле ответа открывается только у того, кто нажал');
+  assert.strictEqual(prompt.payload.reply_parameters.message_id, 77);
+
+  const promptId = 500 + t.fetchCalls.filter(c => c.url.endsWith('/sendMessage') || c.url.endsWith('/sendPoll')).length - 1;
+  const answer = (text, from, replyToId) => ({
+    postData: { contents: JSON.stringify({ update_id: nextUpdateId++, message: { message_id: 90, chat: { id: Number(CLUB), type: 'supergroup' }, from, text, reply_to_message: { message_id: replyToId } } }) },
+    parameter: { secret: 'test-secret' }
+  });
+  // Чужой ответ на тот же запрос — не заявка
+  t.ctx.handleTelegramUpdate(answer('Чужая книга', MASHA, promptId));
+  t.ctx.handleTelegramUpdate(answer('Дюна — Герберт', ANTON, promptId));
+  assert.ok(lastChat(t.fetchCalls).includes('✅ «Дюна — Герберт» — в заявках'));
+  // Повторный ответ на тот же запрос уже не считается заявкой
+  t.ctx.handleTelegramUpdate(answer('Ещё одна', ANTON, promptId));
+  t.ctx.handleTelegramUpdate(groupMsg('/books', OLYA));
+  const list = lastChat(t.fetchCalls);
+  assert.ok(list.includes('1. Дюна — Герберт (от Антон)') && !list.includes('Чужая') && !list.includes('Ещё одна'));
+});
+
+test('То же в личке: /question без текста → ответ → анонимный вопрос', () => {
+  const t = cycleWithSubmissions();
+  t.ctx.handleTelegramUpdate(groupMsg('/skip', ANTON));
+  t.ctx.handleTelegramUpdate(groupMsg('/skip', ANTON));
+  t.ctx.handleTelegramUpdate(privateMsg('/question', MASHA));
+  const prompt = dmMessages(t.fetchCalls, 222).pop();
+  assert.ok(prompt.payload.text.includes('Пришли вопрос'));
+  const promptId = 500 + t.fetchCalls.filter(c => c.url.endsWith('/sendMessage') || c.url.endsWith('/sendPoll')).length - 1;
+  t.ctx.handleTelegramUpdate({
+    postData: { contents: JSON.stringify({ update_id: nextUpdateId++, message: { message_id: 6, chat: { id: 222, type: 'private' }, from: MASHA, text: 'Зачем автор так закончил книгу?', reply_to_message: { message_id: promptId } } }) },
+    parameter: { secret: 'test-secret' }
+  });
+  assert.ok(dmMessages(t.fetchCalls, 222).pop().payload.text.includes('сохранён (анонимно)'));
+  assert.strictEqual(t.ss.getSheetByName('Вопросы к встрече').getRange(2, 4).getValue(), 'аноним');
+});
+
+test('/guide — пошаговая инструкция со всеми шагами, форматом заявки и тем, как голосовать', () => {
+  const t = makeContext();
+  t.ctx.handleTelegramUpdate(groupMsg('/guide', ANTON));
+  const g = lastChat(t.fetchCalls);
+  for (const part of ['1️⃣ ЗАЯВКИ — 7 дней', '/suggest_book Пикник на обочине — Стругацкие', '/remove_book 2',
+    '2️⃣ ГОЛОСОВАНИЕ — 3 дня', 'можно несколько', 'Голоса видны всем', 'Отменить голос', 'жребий',
+    '3️⃣ ВРЕМЯ ВСТРЕЧИ — 2 дня', 'Отметь ВСЕ часы', 'UTC+0', '/another_time',
+    '4️⃣ ЧТЕНИЕ', '/question', 'в личку', '5️⃣ ВСТРЕЧА И ОЦЕНКА', '(анонимно)', '/start_cycle']) {
+    assert.ok(g.includes(part), `в инструкции есть «${part}»`);
+  }
+  assert.ok(g.length < 4096, 'влезает в одно сообщение Telegram');
+  t.ctx.handleTelegramUpdate(privateMsg('/guide', STRANGER));
+  assert.ok(dmMessages(t.fetchCalls, 999).pop().payload.text.includes('1️⃣ ЗАЯВКИ'));
+  t.ctx.handleTelegramUpdate(groupMsg('/help', ANTON));
+  assert.ok(lastChat(t.fetchCalls).includes('/guide'));
+});
+
+test('Закреплённое расписание обновляется на каждом этапе и открепляется в конце', () => {
+  const t = cycleWithSubmissions();
+  const pinnedId = t.cycle().pinnedMessageId;
+  assert.ok(pinnedId);
+  const edits = () => t.fetchCalls.filter(c => c.url.endsWith('/editMessageText'));
+  let c = t.cycle();
+  tickAt(t, c.submitUntil, -23 * HOUR); // только напоминание — расписание не меняется
+  assert.strictEqual(edits().length, 0);
+  tickAt(t, c.submitUntil, HOUR);
+  assert.strictEqual(edits().length, 1);
+  assert.strictEqual(edits()[0].payload.message_id, pinnedId);
+  assert.ok(edits()[0].payload.text.includes('Сейчас: 🗳 Голосование за книгу') && edits()[0].payload.text.includes('✅ Заявки'));
+  c = t.cycle();
+  t.vote(c.votePolls[0].messageId, [0, 0, 3, 0]);
+  tickAt(t, c.voteUntil, HOUR);
+  assert.ok(edits().pop().payload.text.includes('«Пикник на обочине»'));
+  t.ctx.handleTelegramUpdate(groupMsg('/set_meeting 20.12 15:00', ANTON));
+  assert.ok(edits().pop().payload.text.includes('20 декабря'));
+  t.ctx.handleTelegramUpdate(groupMsg('/skip', ANTON));
+  t.ctx.handleTelegramUpdate(groupMsg('/skip', ANTON));
+  assert.strictEqual(t.cycle().phase, 'done');
+  assert.ok(edits().pop().payload.text.includes('/start_cycle'));
+  assert.ok(t.fetchCalls.some(x => x.url.endsWith('/unpinChatMessage') && x.payload.message_id === pinnedId));
+});
+
+test('Опрос не отправился — этап не закрывается «нулём голосов»: бот переотправляет и продлевает срок', () => {
+  let pollsBroken = true;
+  const t = makeContext({ telegramResponse: (url) => (pollsBroken && url.endsWith('/sendPoll')) ? { ok: false, description: 'Bad Request: polls are not allowed' } : null });
+  t.ctx.handleTelegramUpdate(groupMsg('/start_cycle', MASHA));
+  t.ctx.handleTelegramUpdate(groupMsg('/suggest_book Дюна', ANTON));
+  t.ctx.handleTelegramUpdate(groupMsg('/suggest_book Мор', MASHA));
+  let c = t.cycle();
+  tickAt(t, c.submitUntil, HOUR);
+  assert.ok(texts(chatMessages(t.fetchCalls)).some(x => x.includes('Не получилось отправить опрос')));
+  c = t.cycle();
+  tickAt(t, c.voteUntil, HOUR);
+  assert.strictEqual(t.cycle().phase, 'voting', 'без опроса голосование не закрывается');
+  assert.strictEqual(texts(chatMessages(t.fetchCalls)).filter(x => x.includes('Не получилось отправить опрос')).length, 1, 'предупреждение не спамится');
+  pollsBroken = false;
+  tickAt(t, c.voteUntil, 2 * HOUR);
+  c = t.cycle();
+  assert.strictEqual(c.phase, 'voting');
+  assert.ok(c.votePolls[0].messageId, 'опрос отправлен заново');
+  assert.ok(new Date(c.voteUntil).getTime() > t.clock.now + 20 * HOUR, 'срок продлён, чтобы успели проголосовать');
+  assert.ok(lastChat(t.fetchCalls).includes('отправил его сейчас'));
+  t.vote(c.votePolls[0].messageId, [0, 2]);
+  tickAt(t, c.voteUntil, HOUR);
+  assert.strictEqual(t.cycle().book.title, 'Мор');
+});
+
+test('Перенос встречи не присылает чекпоинт второй раз', () => {
+  const t = cycleWithSubmissions();
+  t.ctx.handleTelegramUpdate(groupMsg('/skip', ANTON));
+  t.ctx.handleTelegramUpdate(groupMsg('/skip', ANTON));
+  t.ctx.handleTelegramUpdate(groupMsg('/set_meeting 20.12 15:00', ANTON));
+  let c = t.cycle();
+  tickAt(t, c.checkpointAt, 10 * 60 * 1000);
+  t.ctx.handleTelegramUpdate(groupMsg('/set_meeting 27.12 15:00', ANTON));
+  c = t.cycle();
+  tickAt(t, c.checkpointAt, 10 * 60 * 1000);
+  assert.strictEqual(pollCalls(t.fetchCalls).filter(p => p.payload.question.includes('Полпути')).length, 1);
+});
+
+test('Ответы на команды приходят ответом на сообщение человека', () => {
+  const t = makeContext();
+  t.ctx.handleTelegramUpdate(groupMsg('/start_cycle', MASHA));
+  t.ctx.handleTelegramUpdate(groupMsg('/suggest_book Дюна', ANTON));
+  assert.strictEqual(chatMessages(t.fetchCalls).pop().payload.reply_parameters.message_id, 77);
+});
+
 // ==================== СТАТИСТИКА ====================
 
 test('/stats: топ книг, меньше всего зашла, чьи книги нравятся больше', () => {
@@ -727,7 +866,7 @@ test('Вебхук: неверный secret, чужой чат, повтор upd
   t.ctx.handleTelegramUpdate(msg);
   t.ctx.handleTelegramUpdate(msg);
   t.ctx.handleTelegramUpdate(msg);
-  assert.strictEqual(texts(chatMessages(t.fetchCalls)).length, 1, 'повтор того же update_id — без ответа');
+  assert.strictEqual(texts(chatMessages(t.fetchCalls)).length, 2, 'повтор того же update_id — без ответа (2 = анонс + расписание)');
 
   assert.strictEqual(t.ctx.handleTelegramUpdate({ postData: { contents: '{bad' }, parameter: { secret: 'test-secret' } }), 'error');
   assert.strictEqual(t.ctx.doPost(groupMsg('/status', ANTON)), undefined);

@@ -27,7 +27,7 @@
 
 // Версия кода — чтобы командой /bot_version в Telegram проверять,
 // какая версия реально задеплоена (а не гадать, доехала ли вставка).
-const BOT_VERSION = '2026.10.14-1';
+const BOT_VERSION = '2026.10.15-1';
 
 // ---------- Расписание цикла (всё правится под клуб) ----------
 const CYCLE_SUBMIT_DAYS = 7;          // приём заявок
@@ -57,6 +57,11 @@ const MEETING_AGENDA = [
   '10 мин — итоги; после встречи в чат придёт опрос «Как вам книга?»',
   '5 мин — что дальше: следующий цикл стартует командой /start_cycle'
 ];
+
+// Какие опросы публичные (видно, кто как проголосовал), а какие анонимные
+const BOOK_VOTE_ANONYMOUS = false;   // голосование за книгу — публичное
+const RATING_ANONYMOUS = true;       // оценка книги — анонимная, чтобы оценки были честными
+const CHECKPOINT_ANONYMOUS = true;   // «как продвигается чтение» — анонимно, без стыда за «ещё не начал»
 
 // Опрос-оценка книги после встречи (порядок важен: первый вариант = 5)
 const RATING_OPTIONS = ['5 — в восторге', '4 — понравилась', '3 — нормально', '2 — не зашла', '1 — совсем не моё'];
@@ -98,7 +103,7 @@ const OBSOLETE_PROPERTIES = ['telegramMembers', 'duels', 'duelWins', 'secretPart
 const OBSOLETE_TRIGGER_HANDLERS = ['sendWeeklyReport', 'createNextSprint'];
 
 // Анонс в чат отправляется один раз на каждое значение этой строки
-const ANNOUNCEMENT_ID = 'cycles-1';
+const ANNOUNCEMENT_ID = 'cycles-2';
 
 const RU_WEEKDAYS_SHORT = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 const RU_WEEKDAYS = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
@@ -131,10 +136,20 @@ function callTelegram(method, payload) {
 /**
  * Отправить сообщение в Telegram — простым текстом (в /командах
  * подчёркивания, Markdown их ломает).
- * extra.chatId — написать не в чат клуба, а в личку участнику.
+ * extra.chatId — написать не в чат клуба, а в личку участнику;
+ * extra.replyTo — ответом на сообщение; extra.replyMarkup — клавиатура/force_reply.
  */
 function sendTelegramMessage(message, extra = {}) {
-  return callTelegram('sendMessage', { chat_id: extra.chatId || TELEGRAM_CHAT_ID, text: message });
+  const payload = { chat_id: extra.chatId || TELEGRAM_CHAT_ID, text: message };
+  if (extra.replyTo) {
+    payload.reply_parameters = { message_id: extra.replyTo, allow_sending_without_reply: true };
+  }
+  if (extra.replyMarkup) payload.reply_markup = extra.replyMarkup;
+  return callTelegram('sendMessage', payload);
+}
+
+function messageIdOf(result) {
+  return result && result.ok && result.result && result.result.message_id ? result.result.message_id : null;
 }
 
 /** Короткое сообщение в чат клуба */
@@ -208,7 +223,7 @@ function collectPollCounts(cycle, holder, messageId, optionsCount) {
 function sendPollOrWarn(question, options, extra) {
   const messageId = sendPoll(question, options, extra);
   if (!messageId) {
-    sendChatText('⚠️ Не получилось отправить опрос. Проверьте, что боту разрешено отправлять опросы в группе. Админ может повторить этап: /skip');
+    sendChatText('⚠️ Не получилось отправить опрос. Проверьте, что боту разрешено отправлять опросы в группе — бот попробует ещё раз через час и, если нужно, продлит срок.');
   }
   return messageId;
 }
@@ -491,6 +506,100 @@ function formatTimeline(cycle) {
   return lines.join('\n');
 }
 
+// Что делать участнику прямо сейчас — в /status и в закреплённом расписании
+const PHASE_HINTS = {
+  submissions: `👉 Сейчас: предложи до ${BOOKS_PER_MEMBER} книг — /suggest_book Название — автор\nЗаявки: /books`,
+  voting: '👉 Сейчас: отметь в опросе все книги, которые хочешь читать (можно несколько)',
+  scheduling: '👉 Сейчас: в двух опросах (суббота и воскресенье) отметь все часы, когда сможешь прийти. Не подходят выходные — /another_time',
+  reading: '👉 Сейчас: читаем 🙂 Вопрос к обсуждению — /question текст (анонимно — в личку боту). Все вопросы: /questions',
+  rating: '👉 Сейчас: оцени книгу в опросе (анонимно)',
+  done: '👉 Следующая книга: /start_cycle'
+};
+
+// ---------- Закреплённое расписание цикла ----------
+//
+// В начале цикла бот присылает и закрепляет сообщение с расписанием и
+// дальше сам его обновляет на каждом этапе. Закреплять бот может, только
+// если он админ с правом закреплять сообщения; если нет — просто не закрепит.
+
+function formatPinnedText(cycle) {
+  let text = `📌 Цикл #${cycle.id}` + (cycle.book ? ` — «${cycle.book.title}»` : '') +
+    `\nРасписание обновляется само.\n\nСейчас: ${cycle.cancelled ? '❌ Цикл отменён' : PHASE_TITLES[cycle.phase]}\n\n`;
+  if (!cycle.cancelled) {
+    text += formatTimeline(cycle);
+    if (cycle.moderator && cycle.phase !== 'done') text += `\n\n🎙 Ведущий встречи: ${cycle.moderator}`;
+  }
+  text += `\n\n${PHASE_HINTS[cycle.phase]}\n\nКак всё устроено: /guide`;
+  return text;
+}
+
+function pinCycleSchedule(cycle) {
+  const messageId = messageIdOf(sendChatText(formatPinnedText(cycle)));
+  if (!messageId) return;
+  cycle.pinnedMessageId = messageId;
+  callTelegram('pinChatMessage', { chat_id: TELEGRAM_CHAT_ID, message_id: messageId, disable_notification: true });
+}
+
+/** Подпись состояния — чтобы обновлять закреп только когда что-то поменялось */
+function cycleSignature(cycle) {
+  return JSON.stringify([cycle && cycle.phase, cycle && cycle.submitUntil, cycle && cycle.voteUntil,
+    cycle && cycle.dateVoteUntil, cycle && cycle.meetingAt, cycle && cycle.book && cycle.book.title, cycle && cycle.cancelled]);
+}
+
+function refreshPinnedSchedule(cycle) {
+  if (!cycle || !cycle.pinnedMessageId) return;
+  callTelegram('editMessageText', { chat_id: TELEGRAM_CHAT_ID, message_id: cycle.pinnedMessageId, text: formatPinnedText(cycle) });
+  if (cycle.phase === 'done') {
+    callTelegram('unpinChatMessage', { chat_id: TELEGRAM_CHAT_ID, message_id: cycle.pinnedMessageId });
+  }
+}
+
+// ---------- «Пришли ответом на это сообщение» ----------
+//
+// Если нажать /suggest_book или /question в меню, Telegram отправит команду
+// без текста. Тогда бот просит прислать название/вопрос ответом на своё
+// сообщение (поле ответа открывается само) — и принимает этот ответ.
+
+const PROMPTS = {
+  suggest_book: '📚 Пришли название книги ответом на это сообщение — можно с автором.\nНапример: Пикник на обочине — Стругацкие',
+  question: '❓ Пришли вопрос к встрече ответом на это сообщение.'
+};
+
+function askForText(kind, message) {
+  const from = message.from || {};
+  const result = sendTelegramMessage(PROMPTS[kind], {
+    chatId: message.chat.id,
+    replyTo: message.message_id,
+    replyMarkup: { force_reply: true, selective: true, input_field_placeholder: kind === 'suggest_book' ? 'Название — автор' : 'Вопрос к встрече' }
+  });
+  const messageId = messageIdOf(result);
+  if (!messageId) return;
+  withScriptLock(() => {
+    const prompts = readJsonProperty('prompts', {});
+    const now = Date.now();
+    for (const key of Object.keys(prompts)) {
+      if (now - prompts[key].at > 24 * 60 * 60 * 1000) delete prompts[key];
+    }
+    prompts[`${message.chat.id}:${messageId}`] = { kind: kind, userId: String(from.id), at: now };
+    const keys = Object.keys(prompts);
+    if (keys.length > 50) keys.slice(0, keys.length - 50).forEach(k => delete prompts[k]);
+    writeJsonProperty('prompts', prompts);
+  });
+}
+
+/** Это ответ на наш запрос «пришли ответом»? Тогда вернуть вид запроса и забыть его */
+function takePrompt(message) {
+  const replyTo = message.reply_to_message;
+  if (!replyTo || !replyTo.message_id) return null;
+  const key = `${message.chat.id}:${replyTo.message_id}`;
+  const prompts = readJsonProperty('prompts', {});
+  const prompt = prompts[key];
+  if (!prompt || prompt.userId !== String((message.from || {}).id)) return null;
+  delete prompts[key];
+  writeJsonProperty('prompts', prompts);
+  return prompt.kind;
+}
+
 // ==================== ЭТАП 1: ЗАЯВКИ ====================
 
 /** /start_cycle — запустить новый цикл */
@@ -519,14 +628,27 @@ function handleStartCycleCommand() {
   }
   const c = created.cycle;
   sendChatText(
-    `🚀 Цикл #${c.id} начался! Выбираем следующую общую книгу.\n\n` +
-    `${formatTimeline(c)}\n\n` +
-    `📥 Сейчас: предлагайте книги — до ${BOOKS_PER_MEMBER} от каждого:\n/suggest_book название\n` +
-    'В личку боту — тоже можно. Список заявок: /books');
+    `🚀 Цикл #${c.id} начался — выбираем следующую общую книгу!\n\n` +
+    `📥 Шаг 1 из 5 — заявки, до ${formatDeadline(c.submitUntil)}\n` +
+    `Каждый может предложить до ${BOOKS_PER_MEMBER} ${pluralRu(BOOKS_PER_MEMBER, 'книги', 'книг', 'книг')}. Как:\n` +
+    '• напиши в чат: /suggest_book Название — автор\n' +
+    '  например: /suggest_book Пикник на обочине — Стругацкие\n' +
+    '• или просто нажми /suggest_book — бот попросит прислать название ответом\n' +
+    '• можно написать боту в личку — тогда в чате не будет лишних сообщений\n\n' +
+    'Посмотреть заявки: /books · убрать свою: /remove_book номер\n' +
+    'Дальше бот сам запустит голосование. Всё расписание — в закреплённом сообщении.');
+  pinCycleSchedule(c);
+  withScriptLock(() => {
+    const fresh = getCycle();
+    if (fresh && fresh.id === c.id) {
+      fresh.pinnedMessageId = c.pinnedMessageId;
+      saveCycle(fresh);
+    }
+  });
 }
 
 /** /suggest_book — заявка на книгу (только на этапе заявок, до BOOKS_PER_MEMBER от человека) */
-function handleSuggestBookCommand(from, args, reply) {
+function handleSuggestBookCommand(from, args, reply, ask) {
   const cycle = getCycle();
   if (!cycle || cycle.phase !== 'submissions') {
     reply(isCycleActive(cycle)
@@ -536,7 +658,8 @@ function handleSuggestBookCommand(from, args, reply) {
   }
   const title = sanitizeUserText(args, BOOK_TITLE_MAX_LENGTH).replace(/^[«"“„']+|[»"”']+$/g, '').trim();
   if (!title) {
-    reply('Напиши название после команды: /suggest_book Мастер и Маргарита');
+    if (ask) ask('suggest_book');
+    else reply('Напиши название после команды: /suggest_book Пикник на обочине — Стругацкие');
     return;
   }
 
@@ -565,7 +688,8 @@ function handleSuggestBookCommand(from, args, reply) {
   } else if (result.limit) {
     reply(`У тебя уже ${BOOKS_PER_MEMBER} ${pluralRu(BOOKS_PER_MEMBER, 'заявка', 'заявки', 'заявок')}: ${result.limit.map(b => '«' + b.title + '»').join(', ')}. Заменить: /remove_book номер (номера — в /books)`);
   } else {
-    reply(`📚 «${title}» — в заявках (твоих: ${result.mine} из ${BOOKS_PER_MEMBER}, всего: ${result.count}). Голосование — после ${formatDeadline(cycle.submitUntil)}.`);
+    reply(`✅ «${title}» — в заявках (твоих: ${result.mine} из ${BOOKS_PER_MEMBER}, всего: ${result.count}).\n` +
+      `Голосование начнётся ${formatDeadline(cycle.submitUntil)}. Все заявки: /books`);
   }
 }
 
@@ -645,17 +769,28 @@ function closeSubmissions(cycle) {
   cycle.sent = {};
 
   sendChatText(
-    `🗳 Заявки собраны — ${books.length} ${pluralRu(books.length, 'книга', 'книги', 'книг')}! Голосуем до ${formatDeadline(cycle.voteUntil)}.\n` +
-    'Можно выбрать несколько книг. Голосование анонимное.' +
-    (chunks > 1 ? `\nКниг много, поэтому опросов ${chunks} — голосуйте в каждом.` : ''));
+    `🗳 Шаг 2 из 5 — голосование, до ${formatDeadline(cycle.voteUntil)}\n` +
+    `Заявки собраны: ${books.length} ${pluralRu(books.length, 'книга', 'книги', 'книг')}. Опрос — ниже.\n\n` +
+    'Как голосовать:\n' +
+    '• отметь ВСЕ книги, которые хочешь читать — можно несколько\n' +
+    (BOOK_VOTE_ANONYMOUS ? '• голосование анонимное\n' : '• голоса видны всем\n') +
+    '• передумал — нажми на опрос, «Отменить голос», и проголосуй заново\n' +
+    (chunks > 1 ? `• книг много, поэтому опросов ${chunks} — голосуй в каждом\n` : '') +
+    `\nПобеждает книга с наибольшим числом голосов, при ничьей — жребий. Итоги — ${formatDeadline(cycle.voteUntil)}.`);
 
   for (let c = 0; c < chunks; c++) {
     const indexes = [];
     for (let i = c * size; i < Math.min(books.length, (c + 1) * size); i++) indexes.push(i);
-    const question = `📚 Цикл #${cycle.id}: какую книгу читаем?` + (chunks > 1 ? ` (опрос ${c + 1} из ${chunks})` : '');
-    const messageId = sendPollOrWarn(question, indexes.map(i => books[i].title), { multiple: true, anonymous: true });
-    cycle.votePolls.push({ messageId: messageId, candidates: indexes });
+    const poll = { messageId: null, candidates: indexes, part: c + 1, parts: chunks };
+    poll.messageId = sendPollOrWarn(votePollQuestion(cycle, poll), indexes.map(i => books[i].title),
+      { multiple: true, anonymous: BOOK_VOTE_ANONYMOUS });
+    cycle.votePolls.push(poll);
   }
+}
+
+function votePollQuestion(cycle, poll) {
+  return `📚 Цикл #${cycle.id}: какие книги хочешь читать? Отметь все, что нравятся` +
+    (poll.parts > 1 ? ` (опрос ${poll.part} из ${poll.parts})` : '');
 }
 
 // ==================== ЭТАП 2: ГОЛОСОВАНИЕ ====================
@@ -691,7 +826,7 @@ function chooseBook(cycle, candidateIndex, votes, byLot) {
     text += `, голосов: ${votes}`;
     if (byLot) text += ' — была ничья, бот бросил жребий 🎲';
   }
-  text += `\n🎙 Ведущий встречи: ${cycle.moderator} — готовит вопросы и следит за регламентом.`;
+  text += `\n🎙 Ведущий встречи: ${cycle.moderator} — открывает встречу, ведёт обсуждение по вопросам и следит за регламентом.`;
   sendChatText(text);
 
   startScheduling(cycle, addDays(new Date(), CYCLE_READING_WEEKS * 7));
@@ -706,12 +841,24 @@ function startScheduling(cycle, targetDate) {
   cycle.dateVoteUntil = deadlineAfterDays(new Date(), CYCLE_DATE_VOTE_DAYS).toISOString();
   cycle.sent = {};
 
-  const tail = `Какое время подходит? Время — ${MEETING_TIMEZONE_LABEL}. Можно выбрать несколько.`;
-  cycle.datePolls = [saturday, sunday].map(day => ({
-    date: day.toISOString(),
-    messageId: sendPollOrWarn(`📅 Встреча по «${cycle.book.title}» — ${formatDateRu(day)}. ${tail}`, MEETING_TIME_SLOTS, { multiple: true })
-  }));
-  sendChatText(`📅 Выбираем время встречи — голосуйте в опросах выше до ${formatDeadline(cycle.dateVoteUntil)}.\nНе подходят эти выходные — /another_time (сдвинуть на неделю).`);
+  cycle.datePolls = [saturday, sunday].map(day => {
+    const poll = { date: day.toISOString(), messageId: null };
+    poll.messageId = sendPollOrWarn(datePollQuestion(cycle, poll), MEETING_TIME_SLOTS, { multiple: true });
+    return poll;
+  });
+  sendChatText(
+    `📅 Шаг 3 из 5 — время встречи, до ${formatDeadline(cycle.dateVoteUntil)}\n` +
+    `Выше два опроса: ${formatDateRu(saturday)} и ${formatDateRu(sunday)}.\n\n` +
+    'Как голосовать:\n' +
+    '• отметь ВСЕ часы, когда сможешь прийти, — в обоих опросах\n' +
+    `• время — ${MEETING_TIMEZONE_LABEL}\n` +
+    '• не можешь в эти выходные совсем — ничего не отмечай\n\n' +
+    'Бот выберет час, который подходит большинству (при равенстве — более ранний).\n' +
+    `Не подходят эти выходные — /another_time (сдвинуть на неделю, не больше ${DATE_MOVES_PER_CYCLE} раз за цикл).`);
+}
+
+function datePollQuestion(cycle, poll) {
+  return `📅 Встреча по «${cycle.book.title}» — ${formatDateRu(new Date(poll.date))}. Когда сможешь? Отметь все удобные часы (время — ${MEETING_TIMEZONE_LABEL})`;
 }
 
 /** Конец выбора даты: слот с наибольшим числом голосов (при равенстве — более ранний) */
@@ -731,22 +878,28 @@ function closeScheduling(cycle) {
 
 /** Зафиксировать дату встречи и перейти к чтению */
 function setMeeting(cycle, iso, fallback) {
+  // При переносе уже назначенной встречи чекпоинт второй раз не шлём
+  const checkpointSent = cycle.phase === 'reading' && cycle.sent && cycle.sent.checkpoint;
   cycle.meetingAt = iso;
   cycle.phase = 'reading';
   const now = Date.now();
   cycle.checkpointAt = new Date(now + (new Date(iso).getTime() - now) / 2).toISOString();
-  cycle.sent = {};
+  cycle.sent = checkpointSent ? { checkpoint: true } : {};
   sendChatText(
     `📌 Встреча по «${cycle.book.title}» — ${formatMeeting(iso)}` +
-    (fallback ? '\n(за время никто не проголосовал — ставим субботу, ' + DEFAULT_MEETING_SLOT + ')' : '') +
+    (fallback ? `\n(за время никто не проголосовал — ставим субботу, ${DEFAULT_MEETING_SLOT})` : '') +
     `\n🎙 Ведущий: ${cycle.moderator}\n\n` +
-    '📖 Читаем! По дороге записывайте вопросы к обсуждению:\n/question текст (в личку боту — анонимно)\n' +
-    'За сутки до встречи бот соберёт их в общий список. Всё расписание: /status');
+    '📖 Шаг 4 из 5 — читаем!\n' +
+    'Появился вопрос для обсуждения — запиши его, чтобы не забыть:\n' +
+    '• /question текст — или просто /question, бот попросит прислать ответом\n' +
+    '• анонимно — напиши то же самое боту в личку\n\n' +
+    'Все вопросы: /questions. На полпути бот спросит, как идёт чтение; за сутки до встречи пришлёт общий список вопросов, ' +
+    `за ${AGENDA_REMINDER_HOURS} ${pluralRu(AGENDA_REMINDER_HOURS, 'час', 'часа', 'часов')} — план встречи.`);
 }
 
 // ==================== ЭТАП 4: ЧТЕНИЕ И ВСТРЕЧА ====================
 
-function handleQuestionCommand(from, args, reply, anonymous) {
+function handleQuestionCommand(from, args, reply, anonymous, ask) {
   const cycle = getCycle();
   if (!cycle || !cycle.book || !['scheduling', 'reading'].includes(cycle.phase)) {
     reply('Вопросы к встрече принимаются, когда книга цикла уже выбрана. Что сейчас: /status');
@@ -754,7 +907,8 @@ function handleQuestionCommand(from, args, reply, anonymous) {
   }
   const text = sanitizeUserText(args);
   if (!text) {
-    reply('Напиши вопрос после команды: /question Почему герой так поступил в финале?');
+    if (ask) ask('question');
+    else reply('Напиши вопрос после команды: /question Почему герой так поступил в финале?');
     return;
   }
   const saved = withScriptLock(() => {
@@ -766,7 +920,7 @@ function handleQuestionCommand(from, args, reply, anonymous) {
     return;
   }
   const count = getCycleQuestions(cycle.id).length;
-  reply(`❓ Вопрос к встрече по «${cycle.book.title}» сохранён (всего: ${count}). Список: /questions`);
+  reply(`✅ Вопрос к встрече по «${cycle.book.title}» сохранён${anonymous ? ' (анонимно)' : ''}. Всего вопросов: ${count}. Список: /questions`);
 }
 
 function formatQuestionsList(questions) {
@@ -793,7 +947,7 @@ function handleQuestionsListCommand() {
 }
 
 function sendCheckpoint(cycle) {
-  sendPoll(`📖 Полпути до встречи по «${cycle.book.title}»! Как продвигается чтение?`, CHECKPOINT_OPTIONS, { anonymous: true });
+  sendPoll(`📖 Полпути до встречи по «${cycle.book.title}»! Как продвигается чтение? (анонимно)`, CHECKPOINT_OPTIONS, { anonymous: CHECKPOINT_ANONYMOUS });
 }
 
 function sendQuestionsReminder(cycle) {
@@ -823,8 +977,15 @@ function startRating(cycle) {
   cycle.phase = 'rating';
   cycle.rateUntil = deadlineAfterDays(new Date(), CYCLE_RATING_DAYS).toISOString();
   cycle.sent = {};
-  cycle.ratingPoll = sendPollOrWarn(`⭐ Как вам «${cycle.book.title}»?`, RATING_OPTIONS, { anonymous: true });
-  sendChatText(`Спасибо за встречу! 🙌 Оцените книгу в опросе выше — он открыт до ${formatDeadline(cycle.rateUntil)}. Анонимно.`);
+  cycle.ratingPoll = sendPollOrWarn(ratingPollQuestion(cycle), RATING_OPTIONS, { anonymous: RATING_ANONYMOUS });
+  sendChatText(
+    `⭐ Шаг 5 из 5 — оценка. Спасибо за встречу! 🙌\n` +
+    `Оцени «${cycle.book.title}» в опросе выше — ${RATING_ANONYMOUS ? 'анонимно' : 'голоса видны всем'}, до ${formatDeadline(cycle.rateUntil)}.\n` +
+    'Даже если не дочитал(а) или не был(а) на встрече — оцени то, что прочитал(а). Итог попадёт в историю клуба: /history, /stats');
+}
+
+function ratingPollQuestion(cycle) {
+  return `⭐ Как тебе «${cycle.book.title}»? Оценка от 1 до 5${RATING_ANONYMOUS ? ' (анонимно)' : ''}`;
 }
 
 /** /meeting_done — встреча прошла раньше, чем бот прислал оценку сам */
@@ -835,6 +996,7 @@ function handleMeetingDoneCommand() {
     if (Date.now() < new Date(cycle.meetingAt).getTime() - 60 * 60 * 1000) return { early: cycle };
     startRating(cycle);
     saveCycle(cycle);
+    refreshPinnedSchedule(cycle);
     return { ok: true };
   });
   if (!done || done.ok) return;
@@ -884,6 +1046,7 @@ function tick() {
   withScriptLock(() => {
     const cycle = getCycle();
     if (!isCycleActive(cycle)) return;
+    const before = cycleSignature(cycle);
     try {
       advanceCycle(cycle, false);
     } finally {
@@ -891,7 +1054,55 @@ function tick() {
       // не должны потеряться, иначе через час всё уйдёт в чат повторно
       saveCycle(cycle);
     }
+    if (cycleSignature(cycle) !== before) refreshPinnedSchedule(cycle);
   });
+}
+
+/**
+ * Опросы, которые не отправились (например, у бота не было права), —
+ * пробуем отправить снова. Если удалось и до срока меньше суток —
+ * срок продлевается, чтобы все успели проголосовать.
+ * Возвращает true, если какой-то опрос так и не отправился.
+ */
+function resendMissingPolls(cycle) {
+  const pending = [];
+  if (cycle.phase === 'voting') {
+    for (const poll of cycle.votePolls || []) {
+      if (!poll.messageId) pending.push({ set: (id) => { poll.messageId = id; },
+        send: () => sendPoll(votePollQuestion(cycle, poll), poll.candidates.map(i => cycle.candidates[i].title),
+          { multiple: true, anonymous: BOOK_VOTE_ANONYMOUS }) });
+    }
+  } else if (cycle.phase === 'scheduling') {
+    for (const poll of cycle.datePolls || []) {
+      if (!poll.messageId) pending.push({ set: (id) => { poll.messageId = id; },
+        send: () => sendPoll(datePollQuestion(cycle, poll), MEETING_TIME_SLOTS, { multiple: true }) });
+    }
+  } else if (cycle.phase === 'rating' && !cycle.ratingPoll) {
+    pending.push({ set: (id) => { cycle.ratingPoll = id; },
+      send: () => sendPoll(ratingPollQuestion(cycle), RATING_OPTIONS, { anonymous: RATING_ANONYMOUS }) });
+  }
+  if (pending.length === 0) return false;
+
+  let missing = false;
+  let resent = false;
+  for (const item of pending) {
+    const id = item.send();
+    if (id) {
+      item.set(id);
+      resent = true;
+    } else {
+      missing = true;
+    }
+  }
+  if (resent) {
+    const key = { voting: 'voteUntil', scheduling: 'dateVoteUntil', rating: 'rateUntil' }[cycle.phase];
+    const minimum = deadlineAfterDays(new Date(), 1);
+    if (new Date(cycle[key]).getTime() < minimum.getTime()) cycle[key] = minimum.toISOString();
+    sendChatText(`↩️ Опрос не отправился вовремя — отправил его сейчас (выше). Голосуем до ${formatDeadline(cycle[key])}.`);
+    cycle.sent = cycle.sent || {};
+    cycle.sent.voteReminder = true; // только что напомнили — второе напоминание в тот же час не нужно
+  }
+  return missing;
 }
 
 /**
@@ -903,6 +1114,10 @@ function advanceCycle(cycle, force) {
   const due = (iso) => force || (iso && now >= new Date(iso).getTime());
   const before = (iso, hours) => iso && now >= new Date(iso).getTime() - hours * 60 * 60 * 1000;
   cycle.sent = cycle.sent || {};
+
+  // Опрос этапа не отправился — сначала пробуем отправить его, а этап не
+  // закрываем (иначе вышло бы «0 голосов» и случайная книга). /skip — закрывает.
+  if (resendMissingPolls(cycle) && !force) return;
 
   switch (cycle.phase) {
     case 'submissions':
@@ -966,15 +1181,7 @@ function handleStatusCommand() {
   let text = `📚 Цикл #${cycle.id}` + (cycle.book ? ` — «${cycle.book.title}»` : '') + `\nСейчас: ${PHASE_TITLES[cycle.phase]}\n\n`;
   text += formatTimeline(cycle);
   if (cycle.moderator && cycle.phase !== 'done') text += `\n\n🎙 Ведущий встречи: ${cycle.moderator}`;
-  const hints = {
-    submissions: '\n\n👉 Предложить книгу: /suggest_book название · заявки: /books',
-    voting: '\n\n👉 Голосуйте в опросе выше',
-    scheduling: '\n\n👉 Голосуйте за время в опросах выше · не подходят выходные: /another_time',
-    reading: '\n\n👉 Вопрос к встрече: /question текст · список: /questions',
-    rating: '\n\n👉 Оцените книгу в опросе выше',
-    done: '\n\n👉 Следующая книга: /start_cycle'
-  };
-  text += hints[cycle.phase] || '';
+  text += `\n\n${PHASE_HINTS[cycle.phase] || ''}\n\nКак всё устроено: /guide`;
   sendChatText(text);
 }
 
@@ -990,6 +1197,7 @@ function handleAnotherTimeCommand() {
     }
     startScheduling(cycle, addDays(new Date(cycle.datePolls[0].date), 7));
     saveCycle(cycle);
+    refreshPinnedSchedule(cycle);
     return true;
   });
   if (moved === false) {
@@ -1017,6 +1225,7 @@ function handleAdminCommand(command, from, args) {
       } finally {
         saveCycle(cycle);
       }
+      refreshPinnedSchedule(cycle);
       return null;
     }
     if (command === 'cancel_cycle') {
@@ -1028,6 +1237,7 @@ function handleAdminCommand(command, from, args) {
       cycle.phase = 'done';
       cycle.cancelled = true;
       saveCycle(cycle);
+      refreshPinnedSchedule(cycle);
       return `Цикл #${cycle.id} отменён. Новый: /start_cycle`;
     }
     if (command === 'set_meeting') {
@@ -1053,6 +1263,7 @@ function handleAdminCommand(command, from, args) {
       }
       setMeeting(cycle, iso, false);
       saveCycle(cycle);
+      refreshPinnedSchedule(cycle);
       return null;
     }
     return null;
@@ -1156,38 +1367,87 @@ function isOwnBotUsername(name) {
 }
 
 function groupHelpText() {
-  return '📚 Команды книжного клуба\n\n' +
-    'Цикл выбора книги:\n' +
+  return '📚 Команды книжного клуба\n' +
+    'Как всё устроено, по шагам: /guide\n\n' +
+    'Где мы сейчас:\n' +
+    '/status — этап, все даты цикла и что делать сейчас\n\n' +
+    'Выбор книги:\n' +
     '/start_cycle — начать новый цикл\n' +
-    '/status — что сейчас и все даты цикла\n' +
-    `/suggest_book название — предложить книгу (до ${BOOKS_PER_MEMBER} на человека)\n` +
-    '/books — заявки цикла\n' +
+    `/suggest_book Название — автор — предложить книгу (до ${BOOKS_PER_MEMBER} на человека)\n` +
+    '/books — заявки цикла с номерами\n' +
     '/remove_book номер — убрать свою заявку\n\n' +
     'Встреча:\n' +
     '/question текст — вопрос к встрече (в личку боту — анонимно)\n' +
-    '/questions — вопросы к встрече\n' +
-    '/another_time — сдвинуть выбор даты на неделю\n' +
-    '/meeting_done — встреча прошла: сразу опрос-оценка\n\n' +
+    '/questions — все вопросы к встрече\n' +
+    '/another_time — не подходят выходные: сдвинуть выбор даты на неделю\n' +
+    '/meeting_done — встреча закончилась: сразу прислать оценку\n\n' +
     'История:\n' +
     '/history — что мы читали\n' +
     '/stats — оценки, топ книг, чьи книги нравятся больше\n\n' +
-    'Для админов: /skip — следующий этап сейчас, /set_meeting ДД.ММ ЧЧ:ММ, /cancel_cycle\n' +
+    'Для админов чата: /skip — следующий этап сейчас, /set_meeting ДД.ММ ЧЧ:ММ, /cancel_cycle\n' +
     '/bot_version — версия бота';
+}
+
+/** /guide — пошаговая инструкция для участников клуба */
+function guideText() {
+  return '📖 Как устроен клуб — по шагам\n\n' +
+    'Каждая книга проходит один цикл. Бот сам ведёт расписание и напоминает о сроках — ' +
+    'следить за датами не нужно, всё видно в закреплённом сообщении и по /status.\n\n' +
+    `1️⃣ ЗАЯВКИ — ${daysText(CYCLE_SUBMIT_DAYS)}\n` +
+    `Предложи до ${BOOKS_PER_MEMBER} ${pluralRu(BOOKS_PER_MEMBER, 'книги', 'книг', 'книг')}. Напиши в чат одним сообщением:\n` +
+    '/suggest_book Пикник на обочине — Стругацкие\n' +
+    'Или просто нажми /suggest_book — бот попросит прислать название ответом. Можно и в личку боту.\n' +
+    'Передумал — /books покажет заявки с номерами, /remove_book 2 уберёт твою заявку №2.\n\n' +
+    `2️⃣ ГОЛОСОВАНИЕ — ${daysText(CYCLE_VOTE_DAYS)}\n` +
+    'Бот пришлёт опрос со всеми заявками. Отметь ВСЕ книги, которые хочешь читать, — можно несколько. ' +
+    (BOOK_VOTE_ANONYMOUS ? 'Голосование анонимное. ' : 'Голоса видны всем. ') +
+    'Передумал — нажми на опрос, «Отменить голос», и проголосуй заново. ' +
+    'Побеждает книга с наибольшим числом голосов, при ничьей — жребий.\n\n' +
+    `3️⃣ ВРЕМЯ ВСТРЕЧИ — ${daysText(CYCLE_DATE_VOTE_DAYS)}\n` +
+    `Два опроса: суббота и воскресенье примерно через ${CYCLE_READING_WEEKS} ${pluralRu(CYCLE_READING_WEEKS, 'неделю', 'недели', 'недель')}. ` +
+    `Отметь ВСЕ часы, когда сможешь прийти (время — ${MEETING_TIMEZONE_LABEL}). Бот выберет час, который подходит большинству. ` +
+    'Не подходят эти выходные — /another_time.\n\n' +
+    '4️⃣ ЧТЕНИЕ\n' +
+    'Читаем 🙂 Появился вопрос для обсуждения — /question текст (или просто /question, бот попросит прислать ответом). ' +
+    'Анонимно — то же самое боту в личку. Все вопросы: /questions.\n' +
+    'На полпути бот спросит, как идёт чтение. За сутки до встречи пришлёт все вопросы, ' +
+    `за ${AGENDA_REMINDER_HOURS} ${pluralRu(AGENDA_REMINDER_HOURS, 'час', 'часа', 'часов')} — план встречи. ` +
+    'Ведущего встречи бот выбирает сам.\n\n' +
+    '5️⃣ ВСТРЕЧА И ОЦЕНКА\n' +
+    `Через ${MEETING_DURATION_HOURS} ${pluralRu(MEETING_DURATION_HOURS, 'час', 'часа', 'часов')} после начала встречи — опрос «Как тебе книга?» от 1 до 5` +
+    (RATING_ANONYMOUS ? ' (анонимно)' : '') + `, открыт ${daysText(CYCLE_RATING_DAYS)}. ` +
+    'Оценка уходит в историю клуба: /history, /stats.\n\n' +
+    'Дальше — следующая книга: /start_cycle. Все команды: /help';
 }
 
 function privateHelpText() {
   return '🤫 Здесь можно тихо, без сообщения в общем чате:\n\n' +
-    '/question текст — вопрос к встрече (в списке — без имени)\n' +
-    `/suggest_book название — заявка на книгу (до ${BOOKS_PER_MEMBER} на человека)\n\n` +
-    'Остальные команды — в чате клуба, список: /help';
+    '/question текст — вопрос к встрече. В общем списке он будет без имени.\n' +
+    `/suggest_book Название — автор — заявка на книгу (до ${BOOKS_PER_MEMBER} на человека). Имя предложившего видно в /books.\n\n` +
+    'Можно просто нажать команду — бот попросит прислать текст ответом.\n' +
+    'Как всё устроено: /guide · остальные команды — в чате клуба: /help';
 }
 
 function handleGroupMessage(message) {
   const text = message.text.trim();
   const textLower = text.toLowerCase();
   const from = message.from || {};
+  // Ответы бота — ответом на сообщение человека, чтобы было видно, кому
+  const reply = (t) => sendTelegramMessage(t, { replyTo: message.message_id });
+  const ask = (kind) => askForText(kind, message);
+
+  // Ответ на «пришли название/вопрос ответом на это сообщение»
+  const prompted = takePrompt(message);
+  if (prompted === 'suggest_book') {
+    handleSuggestBookCommand(from, text, reply, null);
+    return;
+  }
+  if (prompted === 'question') {
+    handleQuestionCommand(from, text, reply, false, null);
+    return;
+  }
+
   const cmd = parseCommand(text);
-  const reply = (t) => sendChatText(t);
 
   // Текстовый триггер — только сообщение целиком («Встреча закончена!»),
   // а не любая фраза, которая так начинается
@@ -1202,10 +1462,10 @@ function handleGroupMessage(message) {
     case 'start_cycle':
     case 'start_process': handleStartCycleCommand(); break;
     case 'status': handleStatusCommand(); break;
-    case 'suggest_book': handleSuggestBookCommand(from, cmd.args, reply); break;
+    case 'suggest_book': handleSuggestBookCommand(from, cmd.args, reply, ask); break;
     case 'remove_book': handleRemoveBookCommand(from, cmd.args, reply); break;
     case 'books': handleBooksListCommand(); break;
-    case 'question': handleQuestionCommand(from, cmd.args, reply, false); break;
+    case 'question': handleQuestionCommand(from, cmd.args, reply, false, ask); break;
     case 'questions': handleQuestionsListCommand(); break;
     case 'another_time': handleAnotherTimeCommand(); break;
     case 'history': handleHistoryCommand(); break;
@@ -1213,11 +1473,14 @@ function handleGroupMessage(message) {
     case 'skip':
     case 'cancel_cycle':
     case 'set_meeting': handleAdminCommand(cmd.command, from, cmd.args); break;
-    case 'help': sendChatText(groupHelpText()); break;
+    case 'guide':
+    case 'how': sendChatText(guideText()); break;
+    case 'help':
+    case 'start': sendChatText(groupHelpText()); break;
     case 'bot_version': sendChatText(`🤖 Бот книжного клуба, версия ${BOT_VERSION}\nВсе команды: /help`); break;
     default:
       if (RETIRED_COMMANDS.includes(cmd.command)) {
-        sendChatText('Эта команда больше не работает. Все команды: /help');
+        reply('Эта команда больше не работает. Все команды: /help');
       }
       break;
   }
@@ -1226,9 +1489,17 @@ function handleGroupMessage(message) {
 function handlePrivateMessage(message) {
   const chatId = message.chat.id;
   const from = message.from || {};
-  const cmd = parseCommand(message.text.trim());
+  const text = message.text.trim();
   const reply = (t) => sendPrivateText(chatId, t);
+  const ask = (kind) => askForText(kind, message);
 
+  const prompted = takePrompt(message);
+  const cmd = prompted ? { command: prompted, args: text } : parseCommand(text);
+
+  if (cmd && (cmd.command === 'guide' || cmd.command === 'how')) {
+    reply(guideText());
+    return;
+  }
   if (!cmd || !['question', 'suggest_book'].includes(cmd.command)) {
     reply(privateHelpText());
     return;
@@ -1238,8 +1509,9 @@ function handlePrivateMessage(message) {
     reply('Эта команда — только для участников книжного клуба.');
     return;
   }
-  if (cmd.command === 'question') handleQuestionCommand(from, cmd.args, reply, true);
-  else handleSuggestBookCommand(from, cmd.args, reply);
+  const askIfCommand = prompted ? null : ask;
+  if (cmd.command === 'question') handleQuestionCommand(from, cmd.args, reply, true, askIfCommand);
+  else handleSuggestBookCommand(from, cmd.args, reply, askIfCommand);
 }
 
 /** Своих кнопок у бота нет — это могут быть только старые кнопки в истории чата */
@@ -1400,6 +1672,7 @@ function setupTelegramWebhook(webAppUrl) {
   const setCommands = callTelegram('setMyCommands', {
     commands: [
       { command: 'status', description: 'Что сейчас и все даты цикла' },
+      { command: 'guide', description: 'Как всё устроено — по шагам' },
       { command: 'start_cycle', description: 'Начать новый цикл выбора книги' },
       { command: 'suggest_book', description: 'Предложить книгу (до 2 на человека)' },
       { command: 'books', description: 'Заявки цикла' },
@@ -1419,6 +1692,7 @@ function setupTelegramWebhook(webAppUrl) {
     scope: { type: 'all_private_chats' },
     commands: [
       { command: 'question', description: 'Вопрос к встрече — без имени в списке' },
+      { command: 'guide', description: 'Как всё устроено' },
       { command: 'suggest_book', description: 'Заявка на книгу' },
       { command: 'help', description: 'Что умеет бот' }
     ]
